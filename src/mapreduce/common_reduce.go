@@ -49,7 +49,7 @@ func doReduce(
 		if kv.Key != key {
 			enc.Encode(KeyValue{key, reduceF(key, values)})
 			key = kv.Key
-			values = []string{}
+			values = []string{kv.Value}
 			continue
 		}
 		values = append(values, kv.Value)
