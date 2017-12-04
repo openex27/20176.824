@@ -26,9 +26,24 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 		n_other = len(mapFiles)
 	}
 
+	failTasks := make(chan *DoTaskArgs,ntasks)
 	var wg sync.WaitGroup
 	wg.Add(ntasks)
 	fmt.Printf("Schedule: %v %v tasks (%d I/Os)\n", ntasks, phase, n_other)
+	go func(){
+		for failArg := range failTasks{
+			workerName := <-registerChan
+			go func(name string, args *DoTaskArgs){
+				ok := call(name, "Worker.DoTask", args, &struct{}{})
+				if ok{
+					wg.Done()
+					registerChan <- name
+				}else{
+					failTasks<-args
+				}
+			}(workerName,failArg)
+		}
+	}()
 	for i := 0; i < ntasks; i++ {
 		workerName := <-registerChan
 		var tempArg DoTaskArgs
@@ -50,9 +65,13 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 			}
 		}
 		go func(name string, args *DoTaskArgs) {
-			call(name, "Worker.DoTask", args, &struct{}{})
+			ok := call(name, "Worker.DoTask", args, &struct{}{})
+			if ok{
 			wg.Done()
 			registerChan <- name
+			}else{
+				failTasks<-args
+			}
 		}(workerName, &tempArg)
 
 	}
