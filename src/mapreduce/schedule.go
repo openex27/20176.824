@@ -26,11 +26,10 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 		n_other = len(mapFiles)
 	}
 
-	var wg *sync.WaitGroup
-	wg = new(sync.WaitGroup)
+	var wg sync.WaitGroup
+	wg.Add(ntasks)
 	fmt.Printf("Schedule: %v %v tasks (%d I/Os)\n", ntasks, phase, n_other)
 	for i := 0; i < ntasks; i++ {
-		wg.Add(1)
 		workerName := <-registerChan
 		var tempArg DoTaskArgs
 		if phase == mapPhase {
@@ -50,11 +49,11 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 				n_other,
 			}
 		}
-		go func(name string, args *DoTaskArgs,wg *sync.WaitGroup) {
-			defer wg.Done()
+		go func(name string, args *DoTaskArgs) {
 			call(name, "Worker.DoTask", args, &struct{}{})
+			wg.Done()
 			registerChan <- name
-		}(workerName, &tempArg,wg)
+		}(workerName, &tempArg)
 
 	}
 	wg.Wait()
