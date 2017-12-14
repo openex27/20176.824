@@ -17,7 +17,11 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+
+import (
+	"sync"
+	"sync/atomic"
+)
 import "labrpc"
 
 // import "bytes"
@@ -46,6 +50,10 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 
+	currentTerm int
+	votedFor int
+
+	quitVote chan struct{}
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -58,6 +66,14 @@ func (rf *Raft) GetState() (int, bool) {
 
 	var term int
 	var isleader bool
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	if rf.me == rf.votedFor{
+		isleader = true
+	}else{
+		isleader = false
+	}
 	// Your code here (2A).
 	return term, isleader
 }
@@ -101,6 +117,8 @@ func (rf *Raft) readPersist(data []byte) {
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
+	Term int
+	CandidateId int
 	// Your data here (2A, 2B).
 }
 
@@ -109,6 +127,8 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
+	Term int
+	VoteGranted bool
 	// Your data here (2A).
 }
 
@@ -117,6 +137,23 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term > rf.currentTerm{
+		rf.currentTerm = args.Term
+		rf.votedFor = args.CandidateId
+	}else if args.Term < rf.currentTerm{
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+	}else if rf.votedFor != -1{
+		reply.VoteGranted = false
+		reply.Term = rf.votedFor
+	}else{
+		reply.Term = args.Term
+		reply.VoteGranted = true
+		rf.currentTerm = args.Term
+		rf.votedFor = args.CandidateId
+	}
 }
 
 //
@@ -152,6 +189,71 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
+
+func (rf *Raft) beginVote() {
+	qc := make(chan struct{})
+	voteRetChan := make(chan bool,1)
+
+	rf.mu.Lock()
+	rf.currentTerm++
+	rf.votedFor = -1
+	rf.quitVote = qc
+	args := RequestVoteArgs{
+		Term:rf.currentTerm,
+		CandidateId:rf.me,
+	}
+
+	rf.mu.Unlock()
+	for i:=0;i<len(rf.peers);i++{
+		go func(){
+			reply := new(RequestVoteReply)
+			if ok := rf.sendRequestVote(i,&args,reply);!ok{
+				voteRetChan<-false
+				return
+			}
+			if reply.VoteGranted{
+				voteRetChan<-true
+				return
+			}else {
+				atomic.LoadInt32(&)
+				//TODO
+
+			}
+
+
+
+		}()
+	}
+
+
+
+}
+
+type AppendEntriesArgs struct {
+	Term int
+	LeaderId int
+}
+
+type AppendEntriesReply struct {
+	Term int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply){
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm{
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+
+	rf.currentTerm = args.Term
+	rf.votedFor = args.LeaderId
+
+	//if in vote need close it!TODO
+}
+
 
 
 //
