@@ -17,17 +17,21 @@ package raft
 //   in the same server.
 //
 
-
 import (
+	"math/rand"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 import "labrpc"
 
 // import "bytes"
 // import "encoding/gob"
 
-
+const (
+	HBI = 150
+	LCT = 350
+)
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -51,9 +55,9 @@ type Raft struct {
 	me        int                 // this peer's index into peers[]
 
 	currentTerm int
-	votedFor int
+	votedFor    int //-1表示候选人,值为me表示leader,否则为follow
 
-	quitVote chan struct{}
+	//quitVote chan struct{}
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
@@ -69,9 +73,9 @@ func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term = rf.currentTerm
-	if rf.me == rf.votedFor{
+	if rf.me == rf.votedFor {
 		isleader = true
-	}else{
+	} else {
 		isleader = false
 	}
 	// Your code here (2A).
@@ -109,15 +113,12 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
-	Term int
+	Term        int
 	CandidateId int
 	// Your data here (2A, 2B).
 }
@@ -127,7 +128,7 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 //
 type RequestVoteReply struct {
-	Term int
+	Term        int
 	VoteGranted bool
 	// Your data here (2A).
 }
@@ -139,16 +140,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.Term > rf.currentTerm{
+	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
-	}else if args.Term < rf.currentTerm{
+	} else if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-	}else if rf.votedFor != -1{
+	} else if rf.votedFor != -1 {
 		reply.VoteGranted = false
-		reply.Term = rf.votedFor
-	}else{
+		reply.Term = rf.currentTerm
+	} else { //退出候选人,升级或降级
 		reply.Term = args.Term
 		reply.VoteGranted = true
 		rf.currentTerm = args.Term
@@ -190,70 +191,262 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) beginVote() {
-	qc := make(chan struct{})
-	voteRetChan := make(chan bool,1)
+func (rf *Raft) beginOnceVote() {
+	voteRetChan := make(chan bool, 1)
 
 	rf.mu.Lock()
-	rf.currentTerm++
-	rf.votedFor = -1
-	rf.quitVote = qc
-	args := RequestVoteArgs{
-		Term:rf.currentTerm,
-		CandidateId:rf.me,
+	if rf.votedFor != -1 {
+		rf.mu.Unlock()
+		return
 	}
-
+	oldTerm := rf.currentTerm + 1
+	rf.currentTerm = oldTerm
+	args := RequestVoteArgs{
+		Term:        oldTerm,
+		CandidateId: rf.me,
+	}
 	rf.mu.Unlock()
-	for i:=0;i<len(rf.peers);i++{
-		go func(){
+	//发送所有voteRPC
+	for i := 0; i < len(rf.peers); i++ {
+		go func(who int) {
 			reply := new(RequestVoteReply)
-			if ok := rf.sendRequestVote(i,&args,reply);!ok{
-				voteRetChan<-false
+			if ok := rf.sendRequestVote(who, &args, reply); !ok {
+				voteRetChan <- false
 				return
 			}
-			if reply.VoteGranted{
-				voteRetChan<-true
+			if reply.VoteGranted {
+				voteRetChan <- true
 				return
-			}else {
-				atomic.LoadInt32(&)
-				//TODO
+			} else {
+				rf.mu.Lock()
+				if rf.currentTerm < reply.Term { //切换至follow,通过修改currentTerm抑制获得major后升级
+					rf.currentTerm = reply.Term
 
+				}
+				rf.mu.Unlock()
+				voteRetChan <- false
 			}
+		}(i)
+	}
+	//接收所有RPC结果
+	go func() {
+		count := 0
+		success := 0
+		rf.mu.Lock()
+		all := len(rf.peers)
+		half := all / 2
+		rf.mu.Unlock()
+		upLevel := false
+		for ack := range voteRetChan {
+			count++
+			if count == all {
+				close(voteRetChan)
+			}
+			if ack {
+				success++
+				if !upLevel && success > half {
+					upLevel = true
+					rf.mu.Lock()
+					if rf.currentTerm > oldTerm { //这轮选举已经结束,无法升级
+						rf.mu.Unlock()
+						continue
+					} else {
+						rf.votedFor = rf.me
+						rf.mu.Unlock()
+						//TODO 成为leader,开始心跳
+					}
+				}
+			}
+		}
+	}()
+}
 
-
-
+//BeginVote 状态成为候选者,发起选举
+func (rf *Raft) BeginVote() {
+	ticker := make(chan struct{})
+	//rf.mu.Lock()
+	go rf.beginOnceVote()
+	go func() {
+		ms := rand.Int() % 150
+		time.Sleep(time.Duration(ms)*time.Millisecond + time.Duration(150))
+		ticker <- struct{}{}
+	}()
+	for {
+		<-ticker
+		rf.mu.Lock()
+		if rf.votedFor != -1 {
+			rf.mu.Unlock()
+			break
+		}
+		rf.mu.Unlock()
+		go rf.beginOnceVote()
+		go func() {
+			ms := rand.Int() % 150
+			time.Sleep(time.Duration(ms)*time.Millisecond + time.Duration(150))
+			ticker <- struct{}{}
 		}()
 	}
-
-
-
 }
 
 type AppendEntriesArgs struct {
-	Term int
+	Term     int
 	LeaderId int
 }
 
 type AppendEntriesReply struct {
-	Term int
+	Term    int
 	Success bool
 }
 
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply){
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.Term < rf.currentTerm{
+	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
 	rf.currentTerm = args.Term
-	rf.votedFor = args.LeaderId
+	rf.votedFor = args.LeaderId //(not only)变成follower
+	reply.Term = args.Term
+	reply.Success = true
 
-	//if in vote need close it!TODO
 }
 
+func (rf *Raft) sendHeartbeat(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+type leaderBand struct {
+	sync.Mutex
+	Expired bool
+	Count   int
+}
+
+func (rf *Raft) beginHeartbeat() {
+	rf.mu.Lock()
+	all := len(rf.peers)
+	oldTerm := rf.currentTerm
+	args := AppendEntriesArgs{
+		Term:     oldTerm,
+		LeaderId: rf.me,
+	}
+	rf.mu.Unlock()
+
+	recvAppend := make(chan int, 5)
+
+	go func() { //以HBI为周期发送心跳给各follow
+		t := time.NewTicker(HBI * time.Millisecond)
+		for {
+			<-t.C
+			rf.mu.Lock()
+			if rf.votedFor == -1 || rf.currentTerm>oldTerm{
+				rf.mu.Unlock()
+				close(recvAppend)
+				return
+			}
+			rf.mu.Unlock()
+			for i := 0; i < all; i++ {
+
+				go func(who int) {
+					reply := new(AppendEntriesReply)
+
+					if ok := rf.sendHeartbeat(who, &args, reply); ok {
+						if reply.Success {
+							recvAppend <- who
+						} else {
+							rf.mu.Lock()
+							if rf.currentTerm < reply.Term {
+								rf.mu.Unlock()
+								//TODO convert self into follow
+							} else {
+								rf.mu.Unlock()
+							}
+						}
+					}
+				}(i)
+			}
+		}
+	}()
+
+	go func() { //心跳接收,判断是否leader失效
+		major := all/2 + 1
+		firstLB := leaderBand{
+			Expired: false,
+			Count:   0,
+		}
+		var lBP *leaderBand
+		lBP = &firstLB
+		done := make(chan struct{})
+		go func(lb *leaderBand) {
+			time.Sleep(LCT * time.Millisecond)
+			lb.Lock()
+			defer lb.Unlock()
+			if !lb.Expired {
+				if lb.Count < major { //放权,切换到候选者模式,开始投票
+					done <- struct{}{}
+					//TODO 放权细节
+				}
+
+			}
+		}(lBP)
+
+		markArr := make([]bool,all,all)
+		inCount := 0
+		for{
+
+			select{
+				case <-done:
+					go func(){ //清空channel防止泄露
+						for{
+							_,ok:= <-recvAppend
+							if !ok{
+								return
+							}
+						}
+					}()
+					return
+			default:
+				who, ok := <-recvAppend
+				if !ok{
+					continue
+				}
+				if !markArr[who]{
+					markArr[who] = true
+					inCount++
+				}
+				if inCount == major{
+					inCount = 0
+					flushBoolSlice(&markArr)
+					lBP.Lock()
+					lBP.Expired = true
+					lBP.Unlock()
+					lBP = new(leaderBand)
+					go func(lb *leaderBand) {
+						time.Sleep(LCT * time.Millisecond)
+						lb.Lock()
+						defer lb.Unlock()
+						if !lb.Expired {
+							if lb.Count < major { //放权,切换到候选者模式,开始投票
+								done <- struct{}{}
+								//TODO 放权细节
+							}
+						}
+					}(lBP)
+				}
+			}
+		}
+	}()
+}
+
+func flushBoolSlice(s *[]bool){
+	l := len(*s)
+	for i:=0;i<l;i++{
+		(*s)[i] = false
+	}
+}
 
 
 //
@@ -275,7 +468,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -312,7 +504,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }
