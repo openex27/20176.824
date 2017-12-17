@@ -20,10 +20,12 @@ package raft
 import (
 	"math/rand"
 	"sync"
-	"sync/atomic"
 	"time"
 )
-import "labrpc"
+import (
+	"labrpc"
+	"sync/atomic"
+)
 
 // import "bytes"
 // import "encoding/gob"
@@ -31,6 +33,7 @@ import "labrpc"
 const (
 	HBI = 150
 	LCT = 350
+	FMI = 300
 )
 
 //
@@ -56,6 +59,8 @@ type Raft struct {
 
 	currentTerm int
 	votedFor    int //-1表示候选人,值为me表示leader,否则为follow
+
+	isFollow int32
 
 	//quitVote chan struct{}
 	// Your data here (2A, 2B, 2C).
@@ -140,20 +145,31 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if args.CandidateId == rf.me{
+		reply.VoteGranted = true
+		return
+	}
+
+	if args.Term < rf.currentTerm{
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+		return
+	}
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
-	} else if args.Term < rf.currentTerm {
-		reply.VoteGranted = false
-		reply.Term = rf.currentTerm
-	} else if rf.votedFor != -1 {
-		reply.VoteGranted = false
-		reply.Term = rf.currentTerm
-	} else { //退出候选人,升级或降级
 		reply.Term = args.Term
 		reply.VoteGranted = true
+		atomic.StoreInt32(&rf.isFollow,int32(1))
+	} 	else if rf.votedFor == -1{ // RequestVote RPC : Receiver implementation 2(part)
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
+		reply.Term = args.Term
+		reply.VoteGranted = true
+		atomic.StoreInt32(&rf.isFollow,int32(1))
+	}else { // a.T == r.cT and r.vF != -1 #voted some one in same term
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
 	}
 }
 
@@ -191,21 +207,20 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-func (rf *Raft) beginOnceVote() {
+func (rf *Raft) beginOnceVote(oldTerm int) {
 	voteRetChan := make(chan bool, 1)
 
 	rf.mu.Lock()
-	if rf.votedFor != -1 {
+	if rf.votedFor != -1 || rf.currentTerm>oldTerm{
 		rf.mu.Unlock()
 		return
 	}
-	oldTerm := rf.currentTerm + 1
-	rf.currentTerm = oldTerm
 	args := RequestVoteArgs{
 		Term:        oldTerm,
 		CandidateId: rf.me,
 	}
 	rf.mu.Unlock()
+	DPrintf("start new voting %d",rf.me)
 	//发送所有voteRPC
 	for i := 0; i < len(rf.peers); i++ {
 		go func(who int) {
@@ -216,12 +231,13 @@ func (rf *Raft) beginOnceVote() {
 			}
 			if reply.VoteGranted {
 				voteRetChan <- true
+				DPrintf("me=%d, voter=%d\n",rf.me,who)
 				return
 			} else {
 				rf.mu.Lock()
 				if rf.currentTerm < reply.Term { //切换至follow,通过修改currentTerm抑制获得major后升级
 					rf.currentTerm = reply.Term
-
+					atomic.StoreInt32(&rf.isFollow,int32(1))
 				}
 				rf.mu.Unlock()
 				voteRetChan <- false
@@ -244,6 +260,7 @@ func (rf *Raft) beginOnceVote() {
 			}
 			if ack {
 				success++
+				DPrintf("success = %d\n",success)
 				if !upLevel && success > half {
 					upLevel = true
 					rf.mu.Lock()
@@ -251,9 +268,12 @@ func (rf *Raft) beginOnceVote() {
 						rf.mu.Unlock()
 						continue
 					} else {
-						rf.votedFor = rf.me
+						if rf.votedFor == -1 {
+							rf.votedFor = rf.me
+							go rf.beginHeartbeat()
+						}
 						rf.mu.Unlock()
-						//TODO 成为leader,开始心跳
+
 					}
 				}
 			}
@@ -262,10 +282,17 @@ func (rf *Raft) beginOnceVote() {
 }
 
 //BeginVote 状态成为候选者,发起选举
-func (rf *Raft) BeginVote() {
+func (rf *Raft) beginVote(oldTerm int) {
 	ticker := make(chan struct{})
-	//rf.mu.Lock()
-	go rf.beginOnceVote()
+	rf.mu.Lock()
+	if rf.currentTerm > oldTerm{
+		rf.mu.Unlock()
+		return
+	}
+	rf.currentTerm++
+	oldTerm = rf.currentTerm
+	go rf.beginOnceVote(oldTerm)
+	rf.mu.Unlock()
 	go func() {
 		ms := rand.Int() % 150
 		time.Sleep(time.Duration(ms)*time.Millisecond + time.Duration(150))
@@ -274,12 +301,15 @@ func (rf *Raft) BeginVote() {
 	for {
 		<-ticker
 		rf.mu.Lock()
-		if rf.votedFor != -1 {
+		if rf.votedFor != -1 ||rf.currentTerm>oldTerm{
 			rf.mu.Unlock()
-			break
+			return
 		}
+		rf.currentTerm++
+		oldTerm = rf.currentTerm
+		go rf.beginOnceVote(oldTerm)
 		rf.mu.Unlock()
-		go rf.beginOnceVote()
+
 		go func() {
 			ms := rand.Int() % 150
 			time.Sleep(time.Duration(ms)*time.Millisecond + time.Duration(150))
@@ -306,11 +336,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-
-	rf.currentTerm = args.Term
-	rf.votedFor = args.LeaderId //(not only)变成follower
 	reply.Term = args.Term
 	reply.Success = true
+	if rf.me == args.LeaderId{
+		return
+	}
+	rf.currentTerm = args.Term
+	rf.votedFor = args.LeaderId //(not only)变成follower
+	atomic.StoreInt32(&rf.isFollow,int32(1))
 
 }
 
@@ -322,7 +355,6 @@ func (rf *Raft) sendHeartbeat(server int, args *AppendEntriesArgs, reply *Append
 type leaderBand struct {
 	sync.Mutex
 	Expired bool
-	Count   int
 }
 
 func (rf *Raft) beginHeartbeat() {
@@ -339,28 +371,34 @@ func (rf *Raft) beginHeartbeat() {
 
 	go func() { //以HBI为周期发送心跳给各follow
 		t := time.NewTicker(HBI * time.Millisecond)
+		wg := sync.WaitGroup{}
 		for {
 			<-t.C
 			rf.mu.Lock()
-			if rf.votedFor == -1 || rf.currentTerm>oldTerm{
+			if rf.votedFor == -1 || rf.currentTerm > oldTerm {
 				rf.mu.Unlock()
+				wg.Wait()
 				close(recvAppend)
 				return
 			}
 			rf.mu.Unlock()
+			wg.Add(all)
 			for i := 0; i < all; i++ {
-
 				go func(who int) {
 					reply := new(AppendEntriesReply)
 
 					if ok := rf.sendHeartbeat(who, &args, reply); ok {
 						if reply.Success {
 							recvAppend <- who
+							wg.Done()
 						} else {
+							wg.Done()
 							rf.mu.Lock()
 							if rf.currentTerm < reply.Term {
+								rf.currentTerm = reply.Term
+								//rf.votedFor = -1
 								rf.mu.Unlock()
-								//TODO convert self into follow
+								atomic.StoreInt32(&rf.isFollow,int32(1))
 							} else {
 								rf.mu.Unlock()
 							}
@@ -375,49 +413,58 @@ func (rf *Raft) beginHeartbeat() {
 		major := all/2 + 1
 		firstLB := leaderBand{
 			Expired: false,
-			Count:   0,
 		}
 		var lBP *leaderBand
 		lBP = &firstLB
-		done := make(chan struct{})
+		done := make(chan struct{},1)
+		once := sync.Once{}
+		sendDoneFunc := func(){
+			done <- struct{}{}
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			if rf.currentTerm>oldTerm||rf.votedFor==-1{
+				return
+			}
+
+			rf.votedFor = -1
+			go rf.beginVote(rf.currentTerm)
+			DPrintf("\noutline\n\n")
+		}
 		go func(lb *leaderBand) {
 			time.Sleep(LCT * time.Millisecond)
 			lb.Lock()
 			defer lb.Unlock()
-			if !lb.Expired {
-				if lb.Count < major { //放权,切换到候选者模式,开始投票
-					done <- struct{}{}
-					//TODO 放权细节
-				}
-
+			if !lb.Expired { //放权,切换到候选者模式,开始投票
+				once.Do(sendDoneFunc)
 			}
 		}(lBP)
 
-		markArr := make([]bool,all,all)
+		markArr := make([]bool, all, all)
 		inCount := 0
-		for{
+		for {
+			select {
+			case <-done:
 
-			select{
-				case <-done:
-					go func(){ //清空channel防止泄露
-						for{
-							_,ok:= <-recvAppend
-							if !ok{
-								return
-							}
+				go func() { //清空channel防止泄露
+					for {
+						_, ok := <-recvAppend
+						if !ok {
+							return
 						}
-					}()
-					return
-			default:
-				who, ok := <-recvAppend
-				if !ok{
+
+					}
+				}()
+				return
+			case who, ok := <-recvAppend:
+				if !ok {
 					continue
 				}
-				if !markArr[who]{
+				if !markArr[who] {
 					markArr[who] = true
 					inCount++
 				}
-				if inCount == major{
+				if inCount == major {
 					inCount = 0
 					flushBoolSlice(&markArr)
 					lBP.Lock()
@@ -428,11 +475,8 @@ func (rf *Raft) beginHeartbeat() {
 						time.Sleep(LCT * time.Millisecond)
 						lb.Lock()
 						defer lb.Unlock()
-						if !lb.Expired {
-							if lb.Count < major { //放权,切换到候选者模式,开始投票
-								done <- struct{}{}
-								//TODO 放权细节
-							}
+						if !lb.Expired { //放权,切换到候选者模式,开始投票
+							once.Do(sendDoneFunc)
 						}
 					}(lBP)
 				}
@@ -441,12 +485,35 @@ func (rf *Raft) beginHeartbeat() {
 	}()
 }
 
-func flushBoolSlice(s *[]bool){
+func flushBoolSlice(s *[]bool) {
 	l := len(*s)
-	for i:=0;i<l;i++{
+	for i := 0; i < l; i++ {
 		(*s)[i] = false
 	}
 }
+
+func (rf *Raft) followerMaintain(){
+	t:=time.NewTicker(FMI * time.Millisecond)
+	for{
+		<-t.C
+		followerStatus := atomic.LoadInt32(&rf.isFollow)
+		if followerStatus == int32(1){
+			atomic.StoreInt32(&rf.isFollow,int32(0))
+			DPrintf("%d am follower\n",rf.me)
+			continue
+		}
+		rf.mu.Lock()
+		if rf.votedFor == -1||rf.votedFor == rf.me{
+			DPrintf("%d am not follower\n",rf.me)
+			rf.mu.Unlock()
+			continue
+		}
+		rf.votedFor = -1
+		go rf.beginVote(rf.currentTerm)
+		rf.mu.Unlock()
+	}
+}
+
 
 
 //
@@ -501,7 +568,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-
+	rf.isFollow = int32(0)
+	go rf.followerMaintain()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
