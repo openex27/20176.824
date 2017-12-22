@@ -31,7 +31,7 @@ import (
 // import "encoding/gob"
 
 const (
-	HBI = 150
+	HBI = 80
 	LCT = 350
 	FMI = 300
 )
@@ -51,6 +51,12 @@ type ApplyMsg struct {
 //
 // A Go object implementing a single Raft peer.
 //
+type logEntry struct{
+	Log interface{}
+	Term int
+}
+
+
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -62,6 +68,13 @@ type Raft struct {
 
 	isFollow int32
 
+	logs []logEntry
+	commitIndex int
+	lastApplied int
+
+	nextIndex []int
+	matchIndex []int
+	applyCh chan ApplyMsg
 	//quitVote chan struct{}
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -72,7 +85,6 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	rf.mu.Lock()
@@ -126,6 +138,8 @@ type RequestVoteArgs struct {
 	Term        int
 	CandidateId int
 	// Your data here (2A, 2B).
+	LastLogIndex int
+	LastLogTerm int
 }
 
 //
@@ -156,17 +170,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = args.CandidateId
-		reply.Term = args.Term
-		reply.VoteGranted = true
-		atomic.StoreInt32(&rf.isFollow,int32(1))
+		if args.LastLogTerm >= rf.logs[rf.lastApplied].Term && args.LastLogIndex >= rf.lastApplied {
+			rf.currentTerm = args.Term
+			rf.votedFor = args.CandidateId
+			reply.Term = args.Term
+			reply.VoteGranted = true
+			atomic.StoreInt32(&rf.isFollow, int32(1))
+		}else{
+			reply.VoteGranted = false
+			reply.Term = rf.currentTerm
+		}
 	} 	else if rf.votedFor == -1{ // RequestVote RPC : Receiver implementation 2(part)
-		rf.currentTerm = args.Term
-		rf.votedFor = args.CandidateId
-		reply.Term = args.Term
-		reply.VoteGranted = true
-		atomic.StoreInt32(&rf.isFollow,int32(1))
+		if args.LastLogTerm >= rf.logs[rf.lastApplied].Term && args.LastLogIndex >= rf.lastApplied {
+			rf.currentTerm = args.Term
+			rf.votedFor = args.CandidateId
+			reply.Term = args.Term
+			reply.VoteGranted = true
+			atomic.StoreInt32(&rf.isFollow, int32(1))
+		}else{
+			reply.VoteGranted = false
+			reply.Term = rf.currentTerm
+		}
 	}else { // a.T == r.cT and r.vF != -1 #voted some one in same term
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
@@ -218,6 +242,8 @@ func (rf *Raft) beginOnceVote(oldTerm int) {
 	args := RequestVoteArgs{
 		Term:        oldTerm,
 		CandidateId: rf.me,
+		LastLogIndex:rf.lastApplied,
+		LastLogTerm:rf.logs[rf.lastApplied].Term,
 	}
 	rf.mu.Unlock()
 	DPrintf("start new voting %d",rf.me)
@@ -321,6 +347,12 @@ func (rf *Raft) beginVote(oldTerm int) {
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
+
+	PrevLogIndex int
+	PrevLogTerm int
+	LeaderCommit int
+	Entries interface{}
+
 }
 
 type AppendEntriesReply struct {
@@ -331,11 +363,56 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	var newIndex int
+	//Figure 2:AppendEntries 1
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
+
+	if args.Entries == nil{
+		goto HeartBeat
+	}
+	//Figure 2:AppendEntries 2
+	if args.PrevLogIndex > rf.lastApplied || args.PrevLogTerm != rf.logs[args.PrevLogIndex].Term{
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+	newIndex = args.PrevLogIndex + 1
+	if newIndex <= rf.lastApplied{
+		if rf.logs[newIndex].Term == args.Term{ //Figure 2:AppendEntries 4
+			rf.lastApplied = newIndex
+		}else{	//Figure 2:AppendEntries 3
+			rf.logs[newIndex].Term = args.Term
+			rf.logs[newIndex].Log = args.Entries
+			rf.lastApplied = newIndex
+		}
+	}else{
+		rf.logs[newIndex] = logEntry{
+			Log:args.Entries,
+			Term:args.Term,
+		}
+		rf.lastApplied++
+	}
+
+	if args.LeaderCommit > rf.commitIndex{
+		var minCommit int
+		if rf.lastApplied < args.LeaderCommit{
+			minCommit = rf.lastApplied
+		}else{
+			minCommit = args.LeaderCommit
+		}
+		for i:= rf.commitIndex+1;i<=minCommit;i++{
+			rf.applyCh <- ApplyMsg{
+				Index:i,
+				Command:rf.logs[i].Log,
+			}
+		}
+		rf.commitIndex = minCommit
+	}
+HeartBeat:
 	reply.Term = args.Term
 	reply.Success = true
 	if rf.me == args.LeaderId{
@@ -344,8 +421,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.currentTerm = args.Term
 	rf.votedFor = args.LeaderId //(not only)变成follower
 	atomic.StoreInt32(&rf.isFollow,int32(1))
-
 }
+
+
 
 func (rf *Raft) sendHeartbeat(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
@@ -364,6 +442,7 @@ func (rf *Raft) beginHeartbeat() {
 	args := AppendEntriesArgs{
 		Term:     oldTerm,
 		LeaderId: rf.me,
+		Entries:nil,
 	}
 	rf.mu.Unlock()
 
@@ -534,6 +613,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
+	rf.mu.Lock()
+	if rf.votedFor != rf.me{
+		isLeader = false
+		rf.mu.Unlock()
+	}else{
+
+	}
 	// Your code here (2B).
 
 	return index, term, isLeader
@@ -567,6 +653,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
+	rf.applyCh = applyCh
+	rf.lastApplied = 0
+	rf.commitIndex = 0
+	rf.logs = []logEntry{logEntry{
+		Term:0,
+	}}
+	rf.nextIndex = make([]int,0,len(peers))
+	rf.matchIndex = make([]int,0,len(peers))
 	// Your initialization code here (2A, 2B, 2C).
 	rf.isFollow = int32(0)
 	go rf.followerMaintain()
