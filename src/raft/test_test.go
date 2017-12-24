@@ -108,20 +108,26 @@ func TestFailAgree2B(t *testing.T) {
 
 	// follower network disconnection
 	leader := cfg.checkOneLeader()
+	fmt.Printf("offline %d\n",(leader + 1) % servers)
 	cfg.disconnect((leader + 1) % servers)
 
 	// agree despite one disconnected server?
 	cfg.one(102, servers-1)
+	fmt.Printf("pass1\n")
 	cfg.one(103, servers-1)
+	fmt.Printf("pass2\n")
 	time.Sleep(RaftElectionTimeout)
 	cfg.one(104, servers-1)
+	fmt.Printf("pass3\n")
 	cfg.one(105, servers-1)
+	fmt.Printf("pass4\n")
 
 	// re-connect
 	cfg.connect((leader + 1) % servers)
 
 	// agree with full set of servers?
 	cfg.one(106, servers)
+	fmt.Printf("pass5\n")
 	time.Sleep(RaftElectionTimeout)
 	cfg.one(107, servers)
 
