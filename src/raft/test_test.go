@@ -142,7 +142,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	fmt.Printf("Test (2B): no agreement if too many followers disconnect ...\n")
 
 	cfg.one(10, servers)
-
+	fmt.Printf("pass1\n")
 	// 3 of 5 followers disconnect
 	leader := cfg.checkOneLeader()
 	cfg.disconnect((leader + 1) % servers)
@@ -168,7 +168,7 @@ func TestFailNoAgree2B(t *testing.T) {
 	cfg.connect((leader + 1) % servers)
 	cfg.connect((leader + 2) % servers)
 	cfg.connect((leader + 3) % servers)
-
+	fmt.Println("reconnect")
 	// the disconnected majority may have chosen a leader from
 	// among their own ranks, forgetting index 2.
 	// or perhaps
