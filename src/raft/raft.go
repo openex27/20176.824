@@ -32,8 +32,8 @@ import (
 
 const (
 	HBI = 150
-	LCT = 350
-	FMI = 300
+	LCT = 400
+	FMI = 200 //Follower maintain interval
 )
 
 //
@@ -51,6 +51,11 @@ type ApplyMsg struct {
 //
 // A Go object implementing a single Raft peer.
 //
+type logEntry struct {
+	Log  interface{}
+	Term int
+}
+
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -61,6 +66,21 @@ type Raft struct {
 	votedFor    int //-1表示候选人,值为me表示leader,否则为follow
 
 	isFollow int32
+	isLeader int32
+
+	logs        []logEntry
+	commitIndex int
+	lastApplied int
+
+	nextIndex  []int
+	matchIndex []int
+	applyCh    chan ApplyMsg
+
+	inCatch        []int32
+	hbf            []int32
+	followMinValue []int32
+	startChan      chan struct{}
+	commitChan     chan struct{}
 
 	//quitVote chan struct{}
 	// Your data here (2A, 2B, 2C).
@@ -72,7 +92,6 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
 	var term int
 	var isleader bool
 	rf.mu.Lock()
@@ -126,6 +145,8 @@ type RequestVoteArgs struct {
 	Term        int
 	CandidateId int
 	// Your data here (2A, 2B).
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -145,29 +166,63 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.CandidateId == rf.me{
+	if args.CandidateId == rf.me {
 		reply.VoteGranted = true
 		return
 	}
 
-	if args.Term < rf.currentTerm{
+	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 		return
 	}
 	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.votedFor = args.CandidateId
-		reply.Term = args.Term
-		reply.VoteGranted = true
-		atomic.StoreInt32(&rf.isFollow,int32(1))
-	} 	else if rf.votedFor == -1{ // RequestVote RPC : Receiver implementation 2(part)
-		rf.currentTerm = args.Term
-		rf.votedFor = args.CandidateId
-		reply.Term = args.Term
-		reply.VoteGranted = true
-		atomic.StoreInt32(&rf.isFollow,int32(1))
-	}else { // a.T == r.cT and r.vF != -1 #voted some one in same term
+		if args.LastLogTerm > rf.logs[rf.lastApplied].Term {
+			rf.currentTerm = args.Term
+			rf.votedFor = args.CandidateId
+			reply.Term = args.Term
+			reply.VoteGranted = true
+			atomic.StoreInt32(&rf.isFollow, int32(1))
+			atomic.StoreInt32(&rf.isLeader, int32(0))
+		} else if args.LastLogTerm == rf.logs[rf.lastApplied].Term && args.LastLogIndex >= rf.lastApplied {
+			rf.currentTerm = args.Term
+			rf.votedFor = args.CandidateId
+			reply.Term = args.Term
+			reply.VoteGranted = true
+			atomic.StoreInt32(&rf.isFollow, int32(1))
+			atomic.StoreInt32(&rf.isLeader, int32(0))
+		} else {
+			//	DPrintf("no permise am %d sender %d senderTerm %d\n", rf.me, args.CandidateId, args.Term)
+			reply.VoteGranted = false
+			reply.Term = rf.currentTerm
+			rf.currentTerm = args.Term
+			rf.votedFor = -1
+			atomic.StoreInt32(&rf.isFollow, int32(0))
+			atomic.StoreInt32(&rf.isLeader, int32(0))
+
+			time.Sleep(time.Duration(rand.Int()%50) * time.Millisecond)
+			go rf.beginVote(rf.currentTerm)
+		}
+	} else if rf.votedFor == -1 { // RequestVote RPC : Receiver implementation 2(part)
+		if args.LastLogTerm > rf.logs[rf.lastApplied].Term {
+			rf.currentTerm = args.Term
+			rf.votedFor = args.CandidateId
+			reply.Term = args.Term
+			reply.VoteGranted = true
+			atomic.StoreInt32(&rf.isFollow, int32(1))
+			atomic.StoreInt32(&rf.isLeader, int32(0))
+		}else if args.LastLogTerm == rf.logs[rf.lastApplied].Term && args.LastLogIndex >= rf.lastApplied {
+			rf.currentTerm = args.Term
+			rf.votedFor = args.CandidateId
+			reply.Term = args.Term
+			reply.VoteGranted = true
+			atomic.StoreInt32(&rf.isFollow, int32(1))
+			atomic.StoreInt32(&rf.isLeader, int32(0))
+		} else {
+			reply.VoteGranted = false
+			reply.Term = rf.currentTerm
+		}
+	} else { // a.T == r.cT and r.vF != -1 #voted some one in same term
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 	}
@@ -211,16 +266,18 @@ func (rf *Raft) beginOnceVote(oldTerm int) {
 	voteRetChan := make(chan bool, 1)
 
 	rf.mu.Lock()
-	if rf.votedFor != -1 || rf.currentTerm>oldTerm{
+	if rf.votedFor != -1 || rf.currentTerm > oldTerm {
 		rf.mu.Unlock()
 		return
 	}
 	args := RequestVoteArgs{
-		Term:        oldTerm,
-		CandidateId: rf.me,
+		Term:         oldTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: rf.lastApplied,
+		LastLogTerm:  rf.logs[rf.lastApplied].Term,
 	}
+	//DPrintf("start new voting i am %d  term = %d vf:=%d", rf.me, rf.currentTerm, rf.votedFor)
 	rf.mu.Unlock()
-	DPrintf("start new voting %d",rf.me)
 	//发送所有voteRPC
 	for i := 0; i < len(rf.peers); i++ {
 		go func(who int) {
@@ -231,13 +288,14 @@ func (rf *Raft) beginOnceVote(oldTerm int) {
 			}
 			if reply.VoteGranted {
 				voteRetChan <- true
-				DPrintf("me=%d, voter=%d\n",rf.me,who)
+				//DPrintf("me=%d, voter=%d\n", rf.me, who)
 				return
 			} else {
 				rf.mu.Lock()
 				if rf.currentTerm < reply.Term { //切换至follow,通过修改currentTerm抑制获得major后升级
 					rf.currentTerm = reply.Term
-					atomic.StoreInt32(&rf.isFollow,int32(1))
+					atomic.StoreInt32(&rf.isFollow, int32(1))
+					atomic.StoreInt32(&rf.isLeader, int32(0))
 				}
 				rf.mu.Unlock()
 				voteRetChan <- false
@@ -260,7 +318,7 @@ func (rf *Raft) beginOnceVote(oldTerm int) {
 			}
 			if ack {
 				success++
-				DPrintf("success = %d\n",success)
+				//DPrintf("success = %d\n", success)
 				if !upLevel && success > half {
 					upLevel = true
 					rf.mu.Lock()
@@ -270,7 +328,9 @@ func (rf *Raft) beginOnceVote(oldTerm int) {
 					} else {
 						if rf.votedFor == -1 {
 							rf.votedFor = rf.me
+							atomic.StoreInt32(&rf.isLeader, int32(1))
 							go rf.beginHeartbeat()
+
 						}
 						rf.mu.Unlock()
 
@@ -285,7 +345,7 @@ func (rf *Raft) beginOnceVote(oldTerm int) {
 func (rf *Raft) beginVote(oldTerm int) {
 	ticker := make(chan struct{})
 	rf.mu.Lock()
-	if rf.currentTerm > oldTerm{
+	if rf.currentTerm > oldTerm {
 		rf.mu.Unlock()
 		return
 	}
@@ -301,7 +361,7 @@ func (rf *Raft) beginVote(oldTerm int) {
 	for {
 		<-ticker
 		rf.mu.Lock()
-		if rf.votedFor != -1 ||rf.currentTerm>oldTerm{
+		if rf.votedFor != -1 || rf.currentTerm > oldTerm {
 			rf.mu.Unlock()
 			return
 		}
@@ -321,6 +381,12 @@ func (rf *Raft) beginVote(oldTerm int) {
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
+
+	PrevLogIndex int
+	PrevLogTerm  int
+	LeaderCommit int
+	Entries      interface{}
+	EntriesTerm  int
 }
 
 type AppendEntriesReply struct {
@@ -331,20 +397,78 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	var newIndex int
+	//Figure 2:AppendEntries 1
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
+
+	if args.PrevLogIndex == -1 {
+		goto Committing
+	}
+
+	//if args.Entries == nil {
+	//	goto HeartBeat
+	//}
+	//Figure 2:AppendEntries 2
+	//DPrintf(" pI=%d RI=%d term=%d",args.PrevLogIndex, rf.lastApplied,args.PrevLogTerm)
+	if args.PrevLogIndex > rf.lastApplied || args.PrevLogTerm != rf.logs[args.PrevLogIndex].Term {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		return
+	}
+	//DPrintf("PI=%d RI=%d PT=%d RT=%d",args.PrevLogIndex,rf.lastApplied,args.PrevLogTerm,rf.logs[args.PrevLogIndex].Term)
+	newIndex = args.PrevLogIndex + 1
+	if newIndex <= rf.lastApplied {
+		if rf.logs[newIndex].Term == args.EntriesTerm { //Figure 2:AppendEntries 4
+			rf.lastApplied = newIndex
+		} else { //Figure 2:AppendEntries 3
+			rf.logs[newIndex].Term = args.EntriesTerm
+			rf.logs[newIndex].Log = args.Entries
+			rf.lastApplied = newIndex
+		}
+	} else {
+		rf.lastApplied++
+		if len(rf.logs) == rf.lastApplied {
+			rf.logs = append(rf.logs, logEntry{
+				Log:  args.Entries,
+				Term: args.EntriesTerm,
+			})
+		} else {
+			rf.logs[rf.lastApplied] = logEntry{
+				Log:  args.Entries,
+				Term: args.EntriesTerm,
+			}
+		}
+	}
+
+Committing:
+	if args.LeaderCommit > rf.commitIndex {
+		var minCommit int
+		if rf.lastApplied < args.LeaderCommit {
+			minCommit = rf.lastApplied
+		} else {
+			minCommit = args.LeaderCommit
+		}
+		for i := rf.commitIndex + 1; i <= minCommit; i++ {
+			rf.applyCh <- ApplyMsg{
+				Index:   i,
+				Command: rf.logs[i].Log,
+			}
+		}
+		rf.commitIndex = minCommit
+	}
 	reply.Term = args.Term
 	reply.Success = true
-	if rf.me == args.LeaderId{
+	if rf.me == args.LeaderId {
 		return
 	}
 	rf.currentTerm = args.Term
 	rf.votedFor = args.LeaderId //(not only)变成follower
-	atomic.StoreInt32(&rf.isFollow,int32(1))
-
+	atomic.StoreInt32(&rf.isFollow, int32(1))
+	atomic.StoreInt32(&rf.isLeader, int32(0))
 }
 
 func (rf *Raft) sendHeartbeat(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -362,11 +486,14 @@ func (rf *Raft) beginHeartbeat() {
 	all := len(rf.peers)
 	oldTerm := rf.currentTerm
 	args := AppendEntriesArgs{
-		Term:     oldTerm,
-		LeaderId: rf.me,
+		Term:         oldTerm,
+		LeaderId:     rf.me,
+		Entries:      nil,
+		PrevLogIndex: -1,
 	}
 	rf.mu.Unlock()
-
+	go rf.autoCommit()
+	go rf.catchUper()
 	recvAppend := make(chan int, 5)
 
 	go func() { //以HBI为周期发送心跳给各follow
@@ -382,11 +509,14 @@ func (rf *Raft) beginHeartbeat() {
 				return
 			}
 			rf.mu.Unlock()
-			wg.Add(all)
 			for i := 0; i < all; i++ {
-				go func(who int) {
+				if hbf := atomic.LoadInt32(&rf.hbf[i]); hbf != int32(0) {
+					continue
+				}
+				wg.Add(1)
+				go func(who int, args AppendEntriesArgs) {
 					reply := new(AppendEntriesReply)
-
+					args.LeaderCommit = int(atomic.LoadInt32(&rf.followMinValue[who]))
 					if ok := rf.sendHeartbeat(who, &args, reply); ok {
 						if reply.Success {
 							recvAppend <- who
@@ -396,15 +526,16 @@ func (rf *Raft) beginHeartbeat() {
 							rf.mu.Lock()
 							if rf.currentTerm < reply.Term {
 								rf.currentTerm = reply.Term
-								//rf.votedFor = -1
+								rf.votedFor = -2
 								rf.mu.Unlock()
-								atomic.StoreInt32(&rf.isFollow,int32(1))
+								atomic.StoreInt32(&rf.isFollow, int32(1))
+								atomic.StoreInt32(&rf.isLeader, int32(0))
 							} else {
 								rf.mu.Unlock()
 							}
 						}
 					}
-				}(i)
+				}(i, args)
 			}
 		}
 	}()
@@ -416,20 +547,20 @@ func (rf *Raft) beginHeartbeat() {
 		}
 		var lBP *leaderBand
 		lBP = &firstLB
-		done := make(chan struct{},1)
+		done := make(chan struct{}, 1)
 		once := sync.Once{}
-		sendDoneFunc := func(){
+		sendDoneFunc := func() {
 			done <- struct{}{}
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-
-			if rf.currentTerm>oldTerm||rf.votedFor==-1{
+			if rf.currentTerm > oldTerm || rf.votedFor == -1 {
 				return
 			}
+			rf.votedFor = -2
+			atomic.StoreInt32(&rf.isFollow, int32(1))
+			atomic.StoreInt32(&rf.isLeader, int32(0))
+			//go rf.beginVote(rf.currentTerm)
 
-			rf.votedFor = -1
-			go rf.beginVote(rf.currentTerm)
-			DPrintf("\noutline\n\n")
 		}
 		go func(lb *leaderBand) {
 			time.Sleep(LCT * time.Millisecond)
@@ -445,7 +576,6 @@ func (rf *Raft) beginHeartbeat() {
 		for {
 			select {
 			case <-done:
-
 				go func() { //清空channel防止泄露
 					for {
 						_, ok := <-recvAppend
@@ -492,29 +622,28 @@ func flushBoolSlice(s *[]bool) {
 	}
 }
 
-func (rf *Raft) followerMaintain(){
-	t:=time.NewTicker(FMI * time.Millisecond)
-	for{
+func (rf *Raft) followerMaintain() {
+	t := time.NewTicker(time.Duration(rand.Int()%100+FMI) * time.Millisecond)
+	for {
 		<-t.C
 		followerStatus := atomic.LoadInt32(&rf.isFollow)
-		if followerStatus == int32(1){
-			atomic.StoreInt32(&rf.isFollow,int32(0))
-			DPrintf("%d am follower\n",rf.me)
+		if followerStatus == int32(1) {
+			atomic.StoreInt32(&rf.isFollow, int32(0))
+			//DPrintf("%d am follower\n", rf.me)
 			continue
 		}
 		rf.mu.Lock()
-		if rf.votedFor == -1||rf.votedFor == rf.me{
-			DPrintf("%d am not follower\n",rf.me)
+		if rf.votedFor == -1 || rf.votedFor == rf.me {
+			//DPrintf("%d am not follower\n", rf.me)
 			rf.mu.Unlock()
 			continue
 		}
 		rf.votedFor = -1
+		//DPrintf("begin vote am %d\n", rf.me)
 		go rf.beginVote(rf.currentTerm)
 		rf.mu.Unlock()
 	}
 }
-
-
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -534,9 +663,270 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-	// Your code here (2B).
+	rf.mu.Lock()
 
+	if rf.votedFor != rf.me {
+		isLeader = false
+		rf.mu.Unlock()
+	} else {
+		rf.lastApplied++
+		//	DPrintf("index: %d\n",rf.lastApplied)
+		rf.logs = append(rf.logs, logEntry{
+			Log:  command,
+			Term: rf.currentTerm,
+		})
+		index, term, isLeader = rf.lastApplied, rf.currentTerm, true
+		rf.mu.Unlock()
+		rf.startChan <- struct{}{}
+	}
+	/*
+		if isLeader {
+			DPrintf("index=%d,term=%d,VoteFor=%d\n", index, term, rf.votedFor)
+		}
+	*/
 	return index, term, isLeader
+}
+
+func (rf *Raft) catchUp(which int) {
+	var preTerm, preIndex int
+	var args AppendEntriesArgs
+	defer atomic.StoreInt32(&rf.inCatch[which], int32(0))
+	rf.mu.Lock()
+	if rf.nextIndex[which] > rf.lastApplied {
+		rf.mu.Unlock()
+		return
+	}
+	preIndex = rf.lastApplied - 1
+	preTerm = rf.logs[preIndex].Term
+	rf.mu.Unlock()
+	for {
+		rf.mu.Lock()
+		if rf.votedFor != rf.me {
+			rf.mu.Unlock()
+			return
+		}
+		args = AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: preIndex,
+			PrevLogTerm:  preTerm,
+			LeaderCommit: rf.commitIndex,
+			Entries:      rf.logs[preIndex+1].Log,
+			EntriesTerm:  rf.logs[preIndex+1].Term,
+		}
+		rf.mu.Unlock()
+		reply := new(AppendEntriesReply)
+		status := rf.sendAppendEntry(which, &args, reply)
+		switch status {
+		case 0:
+			preIndex++
+
+			rf.mu.Lock()
+			if rf.nextIndex[which] < preIndex+1 {
+				rf.nextIndex[which] = preIndex + 1
+			}
+
+			if preIndex == rf.lastApplied {
+				rf.mu.Unlock()
+				rf.commitChan <- struct{}{}
+				return
+			}
+			preTerm = rf.logs[preIndex].Term
+			rf.mu.Unlock()
+		case 1:
+			rf.mu.Lock()
+			if rf.currentTerm<reply.Term {
+				rf.currentTerm = reply.Term
+				rf.votedFor = -2
+				atomic.StoreInt32(&rf.isFollow, int32(1))
+				atomic.StoreInt32(&rf.isLeader, int32(0))
+			}
+			rf.mu.Unlock()
+			return
+		case 2:
+			preIndex, preTerm = rf.findPreIndex(preIndex, preTerm)
+		}
+	}
+}
+
+
+func (rf *Raft) findPreIndex(nowIndex int, nowTerm int) (int, int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+		for {
+			nowIndex--
+			if rf.logs[nowIndex].Term != nowTerm {
+				return nowIndex, rf.logs[nowIndex].Term
+			}
+		}
+
+	return nowIndex, nowTerm
+}
+
+func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) int {
+	count := 5
+	for {
+		atomic.StoreInt32(&rf.hbf[server], int32(1))
+		ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+		if !ok {
+			time.Sleep(time.Duration(50+10*count) * time.Millisecond)
+			count++
+			continue //network fail
+		}
+		if !reply.Success {
+			rf.mu.Lock()
+			if args.Term < reply.Term {
+				/*
+				rf.currentTerm = reply.Term
+				rf.votedFor = -2
+				atomic.StoreInt32(&rf.isFollow, int32(1))
+				atomic.StoreInt32(&rf.isLeader, int32(0))
+				*/
+				rf.mu.Unlock()
+				return 1 // highly term turn to follow
+			}
+			rf.mu.Unlock()
+			return 2 // need decrement preIndex
+		}
+		return 0
+	}
+}
+
+func (rf *Raft) catchUper() {
+
+	//defer DPrintf("out catchUper me=%d\n", rf.me)
+	tick := time.NewTicker(50 * time.Millisecond)
+	for {
+		select {
+		case <-rf.startChan:
+		case <-tick.C:
+		}
+		if a := atomic.LoadInt32(&rf.isLeader); a != int32(1) {
+			//DPrintf("bye bye term=%d vf=%d a=%d", rf.currentTerm, rf.votedFor, a)
+			return
+		}
+		rf.mu.Lock()
+		for follower := 0; follower < len(rf.peers); follower++ {
+			if follower == rf.me {
+				continue
+			}
+			if rf.nextIndex[follower] <= rf.lastApplied {
+				if l := atomic.LoadInt32(&rf.inCatch[follower]); l == int32(0) {
+					atomic.StoreInt32(&rf.inCatch[follower], int32(1))
+					go rf.catchUp(follower)
+				}
+			}
+		}
+		rf.mu.Unlock()
+	}
+}
+
+func (rf *Raft) autoCommit() {
+	var args AppendEntriesArgs
+	rf.mu.Lock()
+	args.Term = rf.currentTerm
+	args.LeaderId = rf.me
+	sumPeer := len(rf.peers)
+	rf.mu.Unlock()
+	go func(arg AppendEntriesArgs) {
+		tt := time.NewTicker(100 * time.Millisecond)
+		arg.PrevLogIndex = -1
+		for {
+			<-tt.C
+			if atomic.LoadInt32(&rf.isLeader) != int32(1) {
+				return
+			}
+			rf.mu.Lock()
+			if rf.commitIndex == 0 {
+				rf.mu.Unlock()
+				continue
+			}
+			arg.LeaderCommit = rf.commitIndex
+			matchList := rf.matchIndex
+			rf.mu.Unlock()
+			for i := 0; i < sumPeer; i++ {
+				if i == rf.me {
+					continue
+				}
+				rf.mu.Lock()
+				if matchList[i] < arg.LeaderCommit && matchList[i] < rf.nextIndex[i]-1 {
+
+					minValue := rf.nextIndex[i] - 1
+					if minValue > arg.LeaderCommit {
+						minValue = arg.LeaderCommit
+					}
+					if minValue > rf.matchIndex[i] {
+						rf.matchIndex[i] = minValue
+						atomic.StoreInt32(&rf.followMinValue[i], int32(minValue))
+					}
+				}
+				rf.mu.Unlock()
+			}
+		}
+	}(args)
+
+	leaderCommitTick := time.NewTicker(time.Duration(50) * time.Millisecond)
+	for {
+		select {
+		case <-rf.commitChan:
+		case <-leaderCommitTick.C:
+		}
+
+		if atomic.LoadInt32(&rf.isLeader) != int32(1) {
+			return
+		}
+		//DPrintf("commit!!!!!")
+		rf.mu.Lock()
+		if rf.lastApplied == rf.commitIndex {
+			rf.mu.Unlock()
+			continue
+		}
+		checkIndex := rf.commitIndex + 1
+		count := 1
+		for follower := 0; follower < sumPeer; follower++ {
+			if follower == rf.me {
+				continue
+			}
+			if rf.nextIndex[follower] > checkIndex {
+				count++
+			}
+		}
+		if count > sumPeer/2 {
+			rf.commitIndex++
+			rf.applyCh <- ApplyMsg{
+				Index:   rf.commitIndex,
+				Command: rf.logs[rf.commitIndex].Log,
+			}
+			rf.mu.Unlock()
+		} else {
+			rf.mu.Unlock()
+		}
+
+	}
+}
+
+func (rf *Raft) flushHBF() {
+	sum := len(rf.peers)
+	tick := time.NewTicker(50 * time.Millisecond)
+	for {
+		<-tick.C
+		for i := 0; i < sum; i++ {
+			atomic.StoreInt32(&rf.hbf[i], int32(0))
+		}
+	}
+}
+
+func (rf *Raft) status() {
+	t := time.NewTicker(100 * time.Millisecond)
+	for {
+		<-t.C
+		rf.mu.Lock()
+		if rf.votedFor == rf.me {
+			DPrintf("nextID=%v matchID=%d leaderCID=%d", rf.nextIndex, rf.matchIndex, rf.commitIndex)
+		}
+		DPrintf("%v commitID=%d me=%d", rf.logs, rf.commitIndex, rf.me)
+		rf.mu.Unlock()
+	}
 }
 
 //
@@ -564,14 +954,33 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
+	sumPeers := len(peers)
 	rf.persister = persister
 	rf.me = me
-
+	rf.votedFor = -2
+	rf.applyCh = applyCh
+	rf.lastApplied = 0
+	rf.commitIndex = 0
+	rf.logs = []logEntry{logEntry{
+		Term: 0,
+	}}
+	rf.nextIndex = make([]int, sumPeers, sumPeers)
+	for i := 0; i < len(peers); i++ {
+		rf.nextIndex[i] = 1
+	}
+	rf.matchIndex = make([]int, sumPeers, sumPeers)
 	// Your initialization code here (2A, 2B, 2C).
 	rf.isFollow = int32(0)
-	go rf.followerMaintain()
+	rf.isLeader = int32(0)
+	rf.inCatch = make([]int32, sumPeers, sumPeers)
+	rf.hbf = make([]int32, sumPeers, sumPeers)
+	rf.followMinValue = make([]int32, sumPeers, sumPeers)
+	rf.startChan = make(chan struct{}, 10)
+	rf.commitChan = make(chan struct{}, 10)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
+	go rf.followerMaintain()
+	//go rf.status()
+	go rf.flushHBF()
 	return rf
 }
