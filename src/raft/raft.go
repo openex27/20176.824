@@ -32,7 +32,7 @@ import (
 
 const (
 	HBI = 150
-	LCT = 300
+	LCT = 400
 	FMI = 200 //Follower maintain interval
 )
 
@@ -204,7 +204,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			go rf.beginVote(rf.currentTerm)
 		}
 	} else if rf.votedFor == -1 { // RequestVote RPC : Receiver implementation 2(part)
-		if args.LastLogTerm >= rf.logs[rf.lastApplied].Term && args.LastLogIndex >= rf.lastApplied {
+		if args.LastLogTerm > rf.logs[rf.lastApplied].Term {
+			rf.currentTerm = args.Term
+			rf.votedFor = args.CandidateId
+			reply.Term = args.Term
+			reply.VoteGranted = true
+			atomic.StoreInt32(&rf.isFollow, int32(1))
+			atomic.StoreInt32(&rf.isLeader, int32(0))
+		}else if args.LastLogTerm == rf.logs[rf.lastApplied].Term && args.LastLogIndex >= rf.lastApplied {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateId
 			reply.Term = args.Term
@@ -742,32 +749,17 @@ func (rf *Raft) catchUp(which int) {
 	}
 }
 
+
 func (rf *Raft) findPreIndex(nowIndex int, nowTerm int) (int, int) {
-	//if nowIndex == 0{
-	//	return 0,0
-	//}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	position := -1
-	if rf.logs[nowIndex-1].Term == nowTerm {
-		position = 1 //tail
-	} else {
-		position = 0 //head
-	}
-	switch position {
-	case 0:
-		nowIndex--
-		return nowIndex, rf.logs[nowIndex].Term
-	case 1:
-		nowIndex = nowIndex - 2
 		for {
+			nowIndex--
 			if rf.logs[nowIndex].Term != nowTerm {
-				nowIndex++
 				return nowIndex, rf.logs[nowIndex].Term
 			}
-			nowIndex--
 		}
-	}
+
 	return nowIndex, nowTerm
 }
 
