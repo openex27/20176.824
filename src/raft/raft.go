@@ -158,6 +158,7 @@ func (rf *Raft) readPersist(data []byte) {
 		logLen--
 
 	 }
+	//TODO refresh rf.logs delete uncommitted logs
 	 if Debug ==2 {
 		 DPrintf("read persisted %v commitID=%d lastIndex=%d me=%d", rf.logs, rf.commitIndex, rf.lastApplied, rf.me)
 	 }
@@ -372,7 +373,7 @@ func (rf *Raft) beginOnceVote(oldTerm int) {
 							rf.votedFor = rf.me
 							atomic.StoreInt32(&rf.isLeader, int32(1))
 							go rf.beginHeartbeat()
-
+							//TODO refresh rf.logs delete uncommitted logs
 						}
 						rf.mu.Unlock()
 
@@ -501,6 +502,7 @@ Committing:
 					Index:   i,
 					Command: rf.logs[i].Log,
 				}
+				DPrintf("commit value me=%d log[%d]=%d ",rf.me,i,rf.logs[i].Log)
 			}
 			rf.logs[i].Committed = true
 			rf.UnlockToPersist()
