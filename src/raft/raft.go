@@ -31,8 +31,9 @@ import (
 
 const (
 	HBI = 150
-	LCT = 400
-	FMI = 200 //Follower maintain interval
+	LCT = 800
+	FMI = 500  //Follower maintain interval
+	RVI = 500
 )
 
 //
@@ -76,12 +77,11 @@ type Raft struct {
 	matchIndex []int
 	applyCh    chan ApplyMsg
 
-	inCatch        []int32
-	hbf            []int32
-	followMinValue []int32
-	startChan      chan struct{}
-	commitChan     chan struct{}
-	persistChan    chan struct{}
+	inCatch     []int32
+	hbf         []int32
+	startChan   chan struct{}
+	commitChan  chan struct{}
+	persistChan chan struct{}
 	//quitVote chan struct{}
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -119,11 +119,12 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logs)
+	e.Encode(rf.nextIndex)
 
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 	if Debug == 2 {
-		DPrintf("write persisted %v commitID=%d lastIndex=%d me=%d", rf.logs, rf.commitIndex, rf.lastApplied, rf.me)
+		DPrintf("write persisted %v commitID=%d lastIndex=%d me=%d", rf.nextIndex, rf.commitIndex, rf.lastApplied, rf.me)
 	}
 }
 
@@ -141,6 +142,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.currentTerm)
 	d.Decode(&rf.votedFor)
 	d.Decode(&rf.logs)
+	d.Decode(&rf.nextIndex)
 	logLen := len(rf.logs) - 1
 	rf.lastApplied = logLen
 	for {
@@ -153,7 +155,7 @@ func (rf *Raft) readPersist(data []byte) {
 		}
 		logLen--
 	}
-
+	rf.nextIndex[rf.me] = rf.lastApplied+1
 	if Debug == 2 {
 		DPrintf("read persisted %v commitID=%d lastIndex=%d me=%d", rf.logs, rf.commitIndex, rf.lastApplied, rf.me)
 	}
@@ -225,7 +227,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			atomic.StoreInt32(&rf.isFollow, int32(0))
 			atomic.StoreInt32(&rf.isLeader, int32(0))
 
-			time.Sleep(time.Duration(rand.Int()%50) * time.Millisecond)
+			time.Sleep(time.Duration(rand.Int()%100) * time.Millisecond)
 			go rf.beginVote(rf.currentTerm)
 		}
 	} else if rf.votedFor == -1 || rf.votedFor == -2 { // RequestVote RPC : Receiver implementation 2(part)
@@ -358,11 +360,13 @@ func (rf *Raft) beginOnceVote(oldTerm int) {
 							rf.votedFor = rf.me
 							atomic.StoreInt32(&rf.isLeader, int32(1))
 							DPrintf("be leader %v LA=%d LC=%d me=%d", rf.logs, rf.lastApplied, rf.commitIndex, rf.me)
-							rf.nextIndex = make([]int,all,all)
+							/*
+							rf.nextIndex = make([]int, all, all)
 							for i := 0; i < all; i++ {
 								rf.nextIndex[i] = 1
 							}
-							rf.matchIndex = make([]int,all,all)
+							rf.matchIndex = make([]int, all, all)
+							*/
 							go rf.beginHeartbeat()
 						}
 						rf.mu.Unlock()
@@ -387,7 +391,7 @@ func (rf *Raft) beginVote(oldTerm int) {
 	go rf.beginOnceVote(oldTerm)
 	rf.mu.Unlock()
 	go func() {
-		ms := rand.Int() % 150
+		ms := rand.Int() % 200 + RVI
 		time.Sleep(time.Duration(ms)*time.Millisecond + time.Duration(150))
 		ticker <- struct{}{}
 	}()
@@ -404,7 +408,7 @@ func (rf *Raft) beginVote(oldTerm int) {
 		rf.mu.Unlock()
 
 		go func() {
-			ms := rand.Int() % 150
+			ms := rand.Int() % 200 + RVI
 			time.Sleep(time.Duration(ms)*time.Millisecond + time.Duration(150))
 			ticker <- struct{}{}
 		}()
@@ -420,6 +424,7 @@ type AppendEntriesArgs struct {
 	LeaderCommit int
 	Entries      interface{}
 	EntriesTerm  int
+	NextSnap []int
 }
 
 type AppendEntriesReply struct {
@@ -432,51 +437,43 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	var newIndex int
 	//Figure 2:AppendEntries 1
+	if rf.me == args.LeaderId {
+		reply.Term = args.Term
+		reply.Success = true
+		return
+	}
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
-
 	if args.PrevLogIndex == -1 {
 		goto Committing
 	}
-
-	//if args.Entries == nil {
-	//	goto HeartBeat
-	//}
 	//Figure 2:AppendEntries 2
-	//DPrintf(" pI=%d RI=%d term=%d",args.PrevLogIndex, rf.lastApplied,args.PrevLogTerm)
 	if args.PrevLogIndex > rf.lastApplied || args.PrevLogTerm != rf.logs[args.PrevLogIndex].Term {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
-	//DPrintf("PI=%d RI=%d PT=%d RT=%d",args.PrevLogIndex,rf.lastApplied,args.PrevLogTerm,rf.logs[args.PrevLogIndex].Term)
 	newIndex = args.PrevLogIndex + 1
 	if newIndex <= rf.lastApplied {
 		if rf.logs[newIndex].Term == args.EntriesTerm { //Figure 2:AppendEntries 4
 			rf.lastApplied = newIndex
+			rf.logs = rf.logs[:newIndex+1]
 		} else { //Figure 2:AppendEntries 3
 			rf.logs[newIndex].Term = args.EntriesTerm
 			rf.logs[newIndex].Log = args.Entries
 			rf.lastApplied = newIndex
+			rf.logs = rf.logs[:rf.lastApplied+1]
 		}
 	} else {
 		rf.lastApplied++
-		if len(rf.logs) == rf.lastApplied {
-			rf.logs = append(rf.logs, logEntry{
-				Log:  args.Entries,
-				Term: args.EntriesTerm,
-			})
-		} else {
-			rf.logs[rf.lastApplied] = logEntry{
-				Log:  args.Entries,
-				Term: args.EntriesTerm,
-			}
-		}
+		rf.logs = append(rf.logs, logEntry{
+			Log:  args.Entries,
+			Term: args.EntriesTerm,
+		})
 	}
-
 Committing:
 	if args.LeaderCommit > rf.commitIndex {
 		var minCommit int
@@ -487,12 +484,11 @@ Committing:
 		}
 		if rf.logs[minCommit].Term == args.Term {
 			for i := rf.commitIndex + 1; i <= minCommit; i++ {
+				DPrintf("commit value me=%d log[%d]=%d ", rf.me, i, rf.logs[i].Log)
 				rf.applyCh <- ApplyMsg{
 					Index:   i,
 					Command: rf.logs[i].Log,
 				}
-				DPrintf("commit value me=%d log[%d]=%d ", rf.me, i, rf.logs[i].Log)
-
 				rf.logs[i].Committed = true
 				rf.UnlockToPersist()
 			}
@@ -501,13 +497,11 @@ Committing:
 	}
 	reply.Term = args.Term
 	reply.Success = true
-	if rf.me == args.LeaderId {
-		return
-	}
 	rf.currentTerm = args.Term
 	rf.votedFor = args.LeaderId //(not only)变成follower
 	atomic.StoreInt32(&rf.isFollow, int32(1))
 	atomic.StoreInt32(&rf.isLeader, int32(0))
+	rf.nextIndex = args.NextSnap
 	rf.UnlockToPersist()
 }
 
@@ -548,6 +542,8 @@ func (rf *Raft) beginHeartbeat() {
 				close(recvAppend)
 				return
 			}
+			args.LeaderCommit = rf.commitIndex
+			args.NextSnap = rf.nextIndex
 			rf.mu.Unlock()
 			for i := 0; i < all; i++ {
 				if hbf := atomic.LoadInt32(&rf.hbf[i]); hbf != int32(0) {
@@ -556,7 +552,7 @@ func (rf *Raft) beginHeartbeat() {
 				wg.Add(1)
 				go func(who int, args AppendEntriesArgs) {
 					reply := new(AppendEntriesReply)
-					args.LeaderCommit = int(atomic.LoadInt32(&rf.followMinValue[who]))
+					//args.LeaderCommit = int(atomic.LoadInt32(&rf.followMinValue[who]))
 					if ok := rf.sendHeartbeat(who, &args, reply); ok {
 						if reply.Success {
 							recvAppend <- who
@@ -663,7 +659,7 @@ func flushBoolSlice(s *[]bool) {
 }
 
 func (rf *Raft) followerMaintain() {
-	t := time.NewTicker(time.Duration(rand.Int()%100+FMI) * time.Millisecond)
+	t := time.NewTicker(time.Duration(rand.Int()%300+FMI) * time.Millisecond)
 	for {
 		<-t.C
 		followerStatus := atomic.LoadInt32(&rf.isFollow)
@@ -715,20 +711,16 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 			Log:  command,
 			Term: rf.currentTerm,
 		})
+		rf.nextIndex[rf.me] = rf.lastApplied + 1
 		index, term, isLeader = rf.lastApplied, rf.currentTerm, true
 		rf.mu.Unlock()
 		rf.persistChan <- struct{}{}
 		rf.startChan <- struct{}{}
 	}
-	/*
-		if isLeader {
-			DPrintf("index=%d,term=%d,VoteFor=%d\n", index, term, rf.votedFor)
-		}
-	*/
 	return index, term, isLeader
 }
 
-func (rf *Raft) catchUp(which int,first bool) {
+func (rf *Raft) catchUp(which int, first bool) {
 	var preTerm, preIndex int
 	var args AppendEntriesArgs
 	defer atomic.StoreInt32(&rf.inCatch[which], int32(0))
@@ -738,10 +730,14 @@ func (rf *Raft) catchUp(which int,first bool) {
 		return
 	}
 	if first == true {
+		/*
 		preIndex = rf.lastApplied - 1
 		preTerm = rf.logs[preIndex].Term
-	}else{
-		preIndex = rf.nextIndex[which]-1
+		*/
+		preIndex = rf.nextIndex[which] - 1
+		preTerm = rf.logs[preIndex].Term
+	} else {
+		preIndex = rf.nextIndex[which] - 1
 		preTerm = rf.logs[preIndex].Term
 	}
 	rf.mu.Unlock()
@@ -751,6 +747,7 @@ func (rf *Raft) catchUp(which int,first bool) {
 			rf.mu.Unlock()
 			return
 		}
+
 		args = AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
@@ -759,19 +756,19 @@ func (rf *Raft) catchUp(which int,first bool) {
 			LeaderCommit: rf.commitIndex,
 			Entries:      rf.logs[preIndex+1].Log,
 			EntriesTerm:  rf.logs[preIndex+1].Term,
+			NextSnap:rf.nextIndex,
 		}
+
 		rf.mu.Unlock()
 		reply := new(AppendEntriesReply)
 		status := rf.sendAppendEntry(which, &args, reply)
 		switch status {
 		case 0:
 			preIndex++
-
 			rf.mu.Lock()
 			if rf.nextIndex[which] < preIndex+1 {
 				rf.nextIndex[which] = preIndex + 1
 			}
-
 			if preIndex == rf.lastApplied {
 				rf.mu.Unlock()
 				rf.commitChan <- struct{}{}
@@ -790,6 +787,7 @@ func (rf *Raft) catchUp(which int,first bool) {
 			rf.mu.Unlock()
 			return
 		case 2:
+			DPrintf("status 2")
 			preIndex, preTerm = rf.findPreIndex(preIndex, preTerm)
 		}
 	}
@@ -809,24 +807,17 @@ func (rf *Raft) findPreIndex(nowIndex int, nowTerm int) (int, int) {
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) int {
-	count := 5
+
 	for {
 		atomic.StoreInt32(&rf.hbf[server], int32(1))
 		ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 		if !ok {
-			time.Sleep(time.Duration(50+10*count) * time.Millisecond)
-			count++
+			time.Sleep(time.Duration(70) * time.Millisecond)
 			continue //network fail
 		}
 		if !reply.Success {
 			rf.mu.Lock()
 			if args.Term < reply.Term {
-				/*
-					rf.currentTerm = reply.Term
-					rf.votedFor = -2
-					atomic.StoreInt32(&rf.isFollow, int32(1))
-					atomic.StoreInt32(&rf.isLeader, int32(0))
-				*/
 				rf.mu.Unlock()
 				return 1 // highly term turn to follow
 			}
@@ -838,7 +829,7 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *Appe
 }
 
 func (rf *Raft) catchUper() {
-	notFirst := make([]bool,len(rf.peers),len(rf.peers))
+	notFirst := make([]bool, len(rf.peers), len(rf.peers))
 	//defer DPrintf("out catchUper me=%d\n", rf.me)
 	tick := time.NewTicker(50 * time.Millisecond)
 	for {
@@ -847,7 +838,6 @@ func (rf *Raft) catchUper() {
 		case <-tick.C:
 		}
 		if a := atomic.LoadInt32(&rf.isLeader); a != int32(1) {
-			//DPrintf("bye bye term=%d vf=%d a=%d", rf.currentTerm, rf.votedFor, a)
 			return
 		}
 		rf.mu.Lock()
@@ -858,13 +848,12 @@ func (rf *Raft) catchUper() {
 			if rf.nextIndex[follower] <= rf.lastApplied {
 				if l := atomic.LoadInt32(&rf.inCatch[follower]); l == int32(0) {
 					atomic.StoreInt32(&rf.inCatch[follower], int32(1))
-					if notFirst[follower] == false{
-						go rf.catchUp(follower,true)
+					if notFirst[follower] == false {
+						go rf.catchUp(follower, true)
 						notFirst[follower] = true
-					}else{
-						go rf.catchUp(follower,false)
+					} else {
+						go rf.catchUp(follower, false)
 					}
-
 				}
 			}
 		}
@@ -880,53 +869,17 @@ func (rf *Raft) autoCommit() {
 	sumPeer := len(rf.peers)
 	catchIndex := rf.lastApplied
 	rf.mu.Unlock()
-	go func(arg AppendEntriesArgs) {
-		tt := time.NewTicker(100 * time.Millisecond)
-		arg.PrevLogIndex = -1
-		for {
-			<-tt.C
-			if atomic.LoadInt32(&rf.isLeader) != int32(1) {
-				return
-			}
-			rf.mu.Lock()
-			if rf.commitIndex == 0 {
-				rf.mu.Unlock()
-				continue
-			}
-			arg.LeaderCommit = rf.commitIndex
-			matchList := rf.matchIndex
-			rf.mu.Unlock()
-			for i := 0; i < sumPeer; i++ {
-				if i == rf.me {
-					continue
-				}
-				rf.mu.Lock()
-				if matchList[i] < arg.LeaderCommit && matchList[i] < rf.nextIndex[i]-1 {
 
-					minValue := rf.nextIndex[i] - 1
-					if minValue > arg.LeaderCommit {
-						minValue = arg.LeaderCommit
-					}
-					if minValue > rf.matchIndex[i] {
-						rf.matchIndex[i] = minValue
-						atomic.StoreInt32(&rf.followMinValue[i], int32(minValue))
-					}
-				}
-				rf.mu.Unlock()
-			}
-		}
-	}(args)
-
-	leaderCommitTick := time.NewTicker(time.Duration(50) * time.Millisecond)
+	leaderCommitTick := time.NewTicker(time.Duration(10000) * time.Millisecond)
 	catched := false
 
 	for {
-	//fastCommit:
+
 		select {
 		case <-rf.commitChan:
 		case <-leaderCommitTick.C:
 		}
-
+	fastCommit:
 		if atomic.LoadInt32(&rf.isLeader) != int32(1) {
 			return
 		}
@@ -954,8 +907,8 @@ func (rf *Raft) autoCommit() {
 				}
 				if inCount > sumPeer/2 {
 					catched = true
-					//rf.mu.Unlock()
-					//goto fastCommit
+					rf.mu.Unlock()
+					goto fastCommit
 				}
 			}
 		END:
@@ -979,9 +932,10 @@ func (rf *Raft) autoCommit() {
 				Command: rf.logs[checkIndex].Log,
 			}
 			rf.logs[checkIndex].Committed = true
+			DPrintf("commit value me=%d log[%d]=%d ", rf.me, checkIndex, rf.logs[checkIndex].Log)
 			rf.mu.Unlock()
 			rf.persistChan <- struct{}{}
-			//goto fastCommit
+			goto fastCommit
 		} else {
 			rf.mu.Unlock()
 		}
@@ -1001,10 +955,10 @@ func (rf *Raft) flushHBF() {
 }
 
 func (rf *Raft) status() {
-	if Debug == 0 {
+	if Debug != 2 {
 		return
 	}
-	t := time.NewTicker(100 * time.Millisecond)
+	t := time.NewTicker(300 * time.Millisecond)
 	for {
 		<-t.C
 		rf.mu.Lock()
@@ -1068,14 +1022,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.isLeader = int32(0)
 	rf.inCatch = make([]int32, sumPeers, sumPeers)
 	rf.hbf = make([]int32, sumPeers, sumPeers)
-	rf.followMinValue = make([]int32, sumPeers, sumPeers)
 	rf.startChan = make(chan struct{}, 10)
 	rf.commitChan = make(chan struct{}, 10)
 	rf.persistChan = make(chan struct{})
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	go rf.followerMaintain()
-	//go rf.status()
+	go rf.status()
 	go rf.flushHBF()
 	go rf.flushPersistent()
 	return rf
