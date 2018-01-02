@@ -75,7 +75,7 @@ type Raft struct {
 	inCatch     []int32
 	hbf         []int32
 	startChan   chan struct{}
-	commitChan  chan struct{}
+	//commitChan  chan struct{}
 	persistChan chan struct{}
 }
 
@@ -427,8 +427,7 @@ Committing:
 		}
 		if rf.logs[minCommit].Term == args.Term {
 			for i := rf.commitIndex + 1; i <= minCommit; i++ {
-				//fmt.Printf("i = %d\n",i)
-
+				DPrintf("i=%d len=%d",i,len(rf.logs))
 				rf.applyCh <- ApplyMsg{
 					Index:   i,
 					Command: rf.logs[i].Log,
@@ -704,6 +703,7 @@ func (rf *Raft) catchUp(which int) {
 		switch status {
 		case 0:
 			preIndex++
+			DPrintf("preIndex = %d  --- %d",preIndex,which)
 			rf.mu.Lock()
 			if rf.matchIndex[which] < preIndex {
 				rf.matchIndex[which] = preIndex
@@ -711,10 +711,9 @@ func (rf *Raft) catchUp(which int) {
 			if rf.nextIndex[which] < preIndex+1 {
 				rf.nextIndex[which] = preIndex + 1
 			}
-
 			if preIndex == rf.lastApplied {
 				rf.mu.Unlock()
-				rf.commitChan <- struct{}{}
+				//rf.commitChan <- struct{}{}
 				return
 			}
 			preTerm = rf.logs[preIndex].Term
@@ -810,10 +809,10 @@ func (rf *Raft) autoCommit() {
 	tick := time.NewTicker(100 * time.Millisecond)
 	for {
 		select {
-		case <-rf.commitChan:
+	//	case <-rf.commitChan:
 		case <-tick.C:
 		}
-	//fastCommit:
+	fastCommit:
 		if atomic.LoadInt32(&rf.isLeader) != int32(1) {
 			return
 		}
@@ -840,8 +839,8 @@ func (rf *Raft) autoCommit() {
 				}
 				if inCount > sumPeer/2 {
 					catched = true
-					//rf.mu.Unlock()
-					//goto fastCommit
+					rf.mu.Unlock()
+					goto fastCommit
 				}
 			}
 		END:
@@ -868,7 +867,7 @@ func (rf *Raft) autoCommit() {
 			DPrintf("commit value me=%d log[%d]=%d ", rf.me, checkIndex, rf.logs[checkIndex].Log)
 			rf.mu.Unlock()
 			rf.persistChan <- struct{}{}
-		//	goto fastCommit
+			goto fastCommit
 		} else {
 			rf.mu.Unlock()
 		}
@@ -948,7 +947,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.inCatch = make([]int32, sumPeers, sumPeers)
 	rf.hbf = make([]int32, sumPeers, sumPeers)
 	rf.startChan = make(chan struct{}, 10)
-	rf.commitChan = make(chan struct{}, 10)
+	//rf.commitChan = make(chan struct{}, 10)
 	rf.persistChan = make(chan struct{})
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
