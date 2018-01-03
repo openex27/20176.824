@@ -670,18 +670,17 @@ func (rf *Raft) catchUp(which int) {
 	defer DPrintf("catchUp %d  Done", which)
 	var preTerm, preIndex int
 	var args AppendEntriesArgs
-	var tempEntrys []logEntry
 	defer atomic.StoreInt32(&rf.inCatch[which], int32(0))
-	rf.mu.Lock()
+
+	//defer rf.mu.Unlock()
 	if rf.nextIndex[which] > rf.lastApplied {
-		rf.mu.Unlock()
 		return
 	}
+	rf.mu.Lock()
 	preIndex = rf.nextIndex[which] - 1
 	preTerm = rf.logs[preIndex].Term
 	rf.mu.Unlock()
 	for {
-		copy(tempEntrys, rf.logs[preIndex+1:])
 		rf.mu.Lock()
 		if rf.votedFor != rf.me {
 			rf.mu.Unlock()
@@ -693,8 +692,9 @@ func (rf *Raft) catchUp(which int) {
 			PrevLogIndex: preIndex,
 			PrevLogTerm:  preTerm,
 			LeaderCommit: rf.commitIndex,
-			Entries:      tempEntrys,
 		}
+		args.Entries = make([]logEntry, len(rf.logs[preIndex+1:]))
+		copy(args.Entries, rf.logs[preIndex+1:])
 
 		rf.mu.Unlock()
 		reply := new(AppendEntriesReply)
@@ -703,12 +703,12 @@ func (rf *Raft) catchUp(which int) {
 		case -1:
 			return
 		case 0:
-			preIndex++
-			DPrintf("preIndex = %d  --- %d", preIndex, which)
 			rf.mu.Lock()
-			rf.matchIndex[which] = reply.MyNextIndex
-			rf.nextIndex[which] = reply.MyNextIndex - 1
+			rf.matchIndex[which] = reply.MyNextIndex - 1
+			rf.nextIndex[which] = reply.MyNextIndex
 			rf.mu.Unlock()
+			return
+
 			//rf.commitChan <- struct{}{}
 		case 1:
 			rf.mu.Lock()
@@ -724,8 +724,8 @@ func (rf *Raft) catchUp(which int) {
 			DPrintf("%d reply MyNextIndex = %d", which, reply.MyNextIndex)
 			rf.mu.Lock()
 			preIndex = reply.MyNextIndex - 1
-			rf.nextIndex[which] = reply.MyNextIndex
 			preTerm = rf.logs[preIndex].Term
+			//rf.nextIndex[which] = reply.MyNextIndex
 			rf.mu.Unlock()
 		}
 	}
@@ -907,7 +907,6 @@ func (rf *Raft) status(ccc int32) {
 }
 
 func (rf *Raft) Kill() {
-
 }
 
 var cc = int32(0)
