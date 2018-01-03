@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	HBI = 200
+	HBI = 100
 	LCT = 800
 	FMI = 500 //Follower maintain interval
 	RVI = 500
@@ -75,8 +75,6 @@ type Raft struct {
 	inCatch     []int32
 	hbf         []int32
 	startChan   chan struct{}
-	//commitChan  chan struct{}
-	persistChan chan struct{}
 }
 
 // return currentTerm and whether this server
@@ -92,13 +90,10 @@ func (rf *Raft) GetState() (int, bool) {
 	} else {
 		isleader = false
 	}
-	// Your code here (2A).
 	return term, isleader
 }
 
 func (rf *Raft) persist() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	w := new(bytes.Buffer)
 	e := gob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
@@ -107,7 +102,7 @@ func (rf *Raft) persist() {
 
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
-	if Debug == 2 {
+	if Debug == 3 {
 		DPrintf("write persisted  commitID=%d lastIndex=%d me=%d", rf.commitIndex, rf.lastApplied, rf.me)
 	}
 }
@@ -138,7 +133,7 @@ func (rf *Raft) readPersist(data []byte) {
 		}
 		logLen--
 	}
-	if Debug == 2 {
+	if Debug == 3 {
 		DPrintf("read persisted %v commitID=%d lastIndex=%d me=%d", rf.logs, rf.commitIndex, rf.lastApplied, rf.me)
 	}
 }
@@ -155,11 +150,6 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
-func (rf *Raft) UnlockToPersist() {
-	rf.mu.Unlock()
-	rf.persistChan <- struct{}{}
-	rf.mu.Lock()
-}
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
@@ -182,7 +172,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			atomic.StoreInt32(&rf.isFollow, int32(1))
 			atomic.StoreInt32(&rf.isLeader, int32(0))
-			rf.UnlockToPersist()
+			rf.persist()
 		} else if args.LastLogTerm == rf.logs[rf.lastApplied].Term && args.LastLogIndex >= rf.lastApplied {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateId
@@ -190,7 +180,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			atomic.StoreInt32(&rf.isFollow, int32(1))
 			atomic.StoreInt32(&rf.isLeader, int32(0))
-			rf.UnlockToPersist()
+			rf.persist()
 		} else {
 			//	DPrintf("no permise am %d sender %d senderTerm %d\n", rf.me, args.CandidateId, args.Term)
 			reply.VoteGranted = false
@@ -211,7 +201,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			atomic.StoreInt32(&rf.isFollow, int32(1))
 			atomic.StoreInt32(&rf.isLeader, int32(0))
-			rf.UnlockToPersist()
+			rf.persist()
 		} else if args.LastLogTerm == rf.logs[rf.lastApplied].Term && args.LastLogIndex >= rf.lastApplied {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateId
@@ -219,7 +209,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = true
 			atomic.StoreInt32(&rf.isFollow, int32(1))
 			atomic.StoreInt32(&rf.isLeader, int32(0))
-			rf.UnlockToPersist()
+			rf.persist()
 		} else {
 			reply.VoteGranted = false
 			reply.Term = rf.currentTerm
@@ -269,9 +259,9 @@ func (rf *Raft) beginOnceVote(oldTerm int) {
 					rf.currentTerm = reply.Term
 					atomic.StoreInt32(&rf.isFollow, int32(1))
 					atomic.StoreInt32(&rf.isLeader, int32(0))
+					rf.persist()
 				}
 				rf.mu.Unlock()
-				rf.persistChan <- struct{}{}
 				voteRetChan <- false
 			}
 		}(i)
@@ -388,6 +378,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
+	atomic.StoreInt32(&rf.isFollow, int32(1))
+	atomic.StoreInt32(&rf.isLeader, int32(0))
 	if args.PrevLogIndex == -1 {
 		goto Committing
 	}
@@ -402,13 +394,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	newIndex = args.PrevLogIndex + 1
 	if newIndex <= rf.lastApplied {
 		if rf.logs[newIndex].Term == args.EntriesTerm { //Figure 2:AppendEntries 4
-			rf.lastApplied = newIndex
-			rf.logs = rf.logs[:newIndex+1]
+			//rf.lastApplied = newIndex
+			//rf.logs = rf.logs[:newIndex+1]
 		} else { //Figure 2:AppendEntries 3
 			rf.logs[newIndex].Term = args.EntriesTerm
 			rf.logs[newIndex].Log = args.Entries
 			rf.lastApplied = newIndex
 			rf.logs = rf.logs[:rf.lastApplied+1]
+			rf.persist()
+			DPrintf("persist 2")
 		}
 	} else {
 		rf.lastApplied++
@@ -416,8 +410,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			Log:  args.Entries,
 			Term: args.EntriesTerm,
 		})
+		rf.persist()
+		DPrintf("persist 3")
 	}
 Committing:
+	reply.Term = args.Term
+	reply.Success = true
+	rf.currentTerm = args.Term
+	rf.votedFor = args.LeaderId //(not only)变成follower
+
 	if args.LeaderCommit > rf.commitIndex {
 		var minCommit int
 		if rf.lastApplied < args.LeaderCommit {
@@ -434,18 +435,12 @@ Committing:
 				}
 				DPrintf("follower commit value me=%d log[%d]=%d ", rf.me, i, rf.logs[i].Log)
 				rf.logs[i].Committed = true
-				rf.UnlockToPersist()
+				rf.persist()
+				DPrintf("persist 1")
 			}
 			rf.commitIndex = minCommit
 		}
 	}
-	reply.Term = args.Term
-	reply.Success = true
-	rf.currentTerm = args.Term
-	rf.votedFor = args.LeaderId //(not only)变成follower
-	atomic.StoreInt32(&rf.isFollow, int32(1))
-	atomic.StoreInt32(&rf.isLeader, int32(0))
-	rf.UnlockToPersist()
 }
 
 func (rf *Raft) findMyNextIndex(nowIndex int) (myNextInext int) {
@@ -646,10 +641,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	if rf.votedFor != rf.me {
 		isLeader = false
-		rf.mu.Unlock()
 	} else {
 		rf.lastApplied++
 		//	DPrintf("index: %d\n",rf.lastApplied)
@@ -659,9 +654,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		})
 		rf.nextIndex[rf.me] = rf.lastApplied + 1
 		index, term, isLeader = rf.lastApplied, rf.currentTerm, true
-		rf.mu.Unlock()
-		rf.persistChan <- struct{}{}
-		rf.startChan <- struct{}{}
+		rf.persist()
 	}
 	return index, term, isLeader
 }
@@ -686,7 +679,6 @@ func (rf *Raft) catchUp(which int) {
 			rf.mu.Unlock()
 			return
 		}
-
 		args = AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
@@ -701,6 +693,8 @@ func (rf *Raft) catchUp(which int) {
 		reply := new(AppendEntriesReply)
 		status := rf.sendAppendEntry(which, &args, reply)
 		switch status {
+		case -1:
+			return
 		case 0:
 			preIndex++
 			DPrintf("preIndex = %d  --- %d",preIndex,which)
@@ -741,22 +735,30 @@ func (rf *Raft) catchUp(which int) {
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) int {
+	count := 1
 	for {
-		atomic.StoreInt32(&rf.hbf[server], int32(1))
+
 		ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 		if !ok {
-			time.Sleep(time.Duration(70) * time.Millisecond)
+			if count == 5{
+				DPrintf("duang")
+				return -1
+			}
+			count++
 			continue //network fail
 		}
+
 		if !reply.Success {
-			rf.mu.Lock()
+			//rf.mu.Lock()
 			if args.Term < reply.Term {
-				rf.mu.Unlock()
+			//	rf.mu.Unlock()
 				return 1 // highly term turn to follow
 			}
-			rf.mu.Unlock()
+			//rf.mu.Unlock()
+			atomic.StoreInt32(&rf.hbf[server], int32(1))
 			return 2 // need decrement preIndex
 		}
+		atomic.StoreInt32(&rf.hbf[server], int32(1))
 		return 0
 	}
 }
@@ -865,8 +867,8 @@ func (rf *Raft) autoCommit() {
 			}
 			rf.logs[checkIndex].Committed = true
 			DPrintf("commit value me=%d log[%d]=%d ", rf.me, checkIndex, rf.logs[checkIndex].Log)
+			rf.persist()
 			rf.mu.Unlock()
-			rf.persistChan <- struct{}{}
 			goto fastCommit
 		} else {
 			rf.mu.Unlock()
@@ -907,12 +909,6 @@ func (rf *Raft) status(ccc int32) {
 	}
 }
 
-func (rf *Raft) flushPersistent() {
-	for {
-		<-rf.persistChan
-		rf.persist()
-	}
-}
 
 func (rf *Raft) Kill() {
 
@@ -947,13 +943,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.inCatch = make([]int32, sumPeers, sumPeers)
 	rf.hbf = make([]int32, sumPeers, sumPeers)
 	rf.startChan = make(chan struct{}, 10)
-	//rf.commitChan = make(chan struct{}, 10)
-	rf.persistChan = make(chan struct{})
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 	go rf.followerMaintain()
 	go rf.status(ccc)
 	go rf.flushHBF()
-	go rf.flushPersistent()
 	return rf
 }
