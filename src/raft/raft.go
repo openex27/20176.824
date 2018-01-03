@@ -72,9 +72,9 @@ type Raft struct {
 	matchIndex []int
 	applyCh    chan ApplyMsg
 
-	inCatch     []int32
-	hbf         []int32
-	startChan   chan struct{}
+	inCatch   []int32
+	hbf       []int32
+	startChan chan struct{}
 }
 
 // return currentTerm and whether this server
@@ -149,7 +149,6 @@ type RequestVoteReply struct {
 	Term        int
 	VoteGranted bool
 }
-
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
@@ -353,8 +352,9 @@ type AppendEntriesArgs struct {
 	PrevLogIndex int
 	PrevLogTerm  int
 	LeaderCommit int
-	Entries      interface{}
-	EntriesTerm  int
+	Entries      []logEntry
+	//EntriesTerm  int
+
 }
 
 type AppendEntriesReply struct {
@@ -366,13 +366,14 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	var newIndex int
-	//Figure 2:AppendEntries 1
+	//var newIndex int
+
 	if rf.me == args.LeaderId {
 		reply.Term = args.Term
 		reply.Success = true
 		return
 	}
+	//Figure 2:AppendEntries 1
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
@@ -383,36 +384,43 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex == -1 {
 		goto Committing
 	}
-	//Figure 2:AppendEntries 2
 
+	//Figure 2:AppendEntries 2
 	if args.PrevLogIndex > rf.lastApplied || args.PrevLogTerm != rf.logs[args.PrevLogIndex].Term {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		reply.MyNextIndex = rf.findMyNextIndex(args.PrevLogIndex)
 		return
 	}
-	newIndex = args.PrevLogIndex + 1
-	if newIndex <= rf.lastApplied {
-		if rf.logs[newIndex].Term == args.EntriesTerm { //Figure 2:AppendEntries 4
-			//rf.lastApplied = newIndex
-			//rf.logs = rf.logs[:newIndex+1]
-		} else { //Figure 2:AppendEntries 3
-			rf.logs[newIndex].Term = args.EntriesTerm
-			rf.logs[newIndex].Log = args.Entries
-			rf.lastApplied = newIndex
-			rf.logs = rf.logs[:rf.lastApplied+1]
+
+	rf.logs = rf.logs[:args.PrevLogTerm+1]
+	rf.logs = append(rf.logs, args.Entries...)
+	rf.lastApplied = args.PrevLogIndex + len(args.Entries)
+	reply.MyNextIndex = rf.lastApplied + 1
+	/*
+		newIndex = args.PrevLogIndex + 1
+		if newIndex <= rf.lastApplied {
+			if rf.logs[newIndex].Term == args.EntriesTerm { //Figure 2:AppendEntries 4
+				//rf.lastApplied = newIndex
+				//rf.logs = rf.logs[:newIndex+1]
+			} else { //Figure 2:AppendEntries 3
+				rf.logs[newIndex].Term = args.EntriesTerm
+				rf.logs[newIndex].Log = args.Entries
+				rf.lastApplied = newIndex
+				rf.logs = rf.logs[:rf.lastApplied+1]
+				rf.persist()
+				DPrintf("persist 2")
+			}
+		} else {
+			rf.lastApplied++
+			rf.logs = append(rf.logs, logEntry{
+				Log:  args.Entries,
+				Term: args.EntriesTerm,
+			})
 			rf.persist()
-			DPrintf("persist 2")
+			DPrintf("persist 3")
 		}
-	} else {
-		rf.lastApplied++
-		rf.logs = append(rf.logs, logEntry{
-			Log:  args.Entries,
-			Term: args.EntriesTerm,
-		})
-		rf.persist()
-		DPrintf("persist 3")
-	}
+	*/
 Committing:
 	reply.Term = args.Term
 	reply.Success = true
@@ -428,19 +436,18 @@ Committing:
 		}
 		if rf.logs[minCommit].Term == args.Term {
 			for i := rf.commitIndex + 1; i <= minCommit; i++ {
-				DPrintf("i=%d len=%d",i,len(rf.logs))
+				DPrintf("i=%d len=%d", i, len(rf.logs))
 				rf.applyCh <- ApplyMsg{
 					Index:   i,
 					Command: rf.logs[i].Log,
 				}
 				DPrintf("follower commit value me=%d log[%d]=%d ", rf.me, i, rf.logs[i].Log)
 				rf.logs[i].Committed = true
-				rf.persist()
-				DPrintf("persist 1")
 			}
 			rf.commitIndex = minCommit
 		}
 	}
+	rf.persist()
 }
 
 func (rf *Raft) findMyNextIndex(nowIndex int) (myNextInext int) {
@@ -663,6 +670,7 @@ func (rf *Raft) catchUp(which int) {
 	defer DPrintf("catchUp %d  Done", which)
 	var preTerm, preIndex int
 	var args AppendEntriesArgs
+	var tempEntrys []logEntry
 	defer atomic.StoreInt32(&rf.inCatch[which], int32(0))
 	rf.mu.Lock()
 	if rf.nextIndex[which] > rf.lastApplied {
@@ -671,9 +679,9 @@ func (rf *Raft) catchUp(which int) {
 	}
 	preIndex = rf.nextIndex[which] - 1
 	preTerm = rf.logs[preIndex].Term
-
 	rf.mu.Unlock()
 	for {
+		copy(tempEntrys, rf.logs[preIndex+1:])
 		rf.mu.Lock()
 		if rf.votedFor != rf.me {
 			rf.mu.Unlock()
@@ -685,8 +693,7 @@ func (rf *Raft) catchUp(which int) {
 			PrevLogIndex: preIndex,
 			PrevLogTerm:  preTerm,
 			LeaderCommit: rf.commitIndex,
-			Entries:      rf.logs[preIndex+1].Log,
-			EntriesTerm:  rf.logs[preIndex+1].Term,
+			Entries:      tempEntrys,
 		}
 
 		rf.mu.Unlock()
@@ -697,20 +704,10 @@ func (rf *Raft) catchUp(which int) {
 			return
 		case 0:
 			preIndex++
-			DPrintf("preIndex = %d  --- %d",preIndex,which)
+			DPrintf("preIndex = %d  --- %d", preIndex, which)
 			rf.mu.Lock()
-			if rf.matchIndex[which] < preIndex {
-				rf.matchIndex[which] = preIndex
-			}
-			if rf.nextIndex[which] < preIndex+1 {
-				rf.nextIndex[which] = preIndex + 1
-			}
-			if preIndex == rf.lastApplied {
-				rf.mu.Unlock()
-				//rf.commitChan <- struct{}{}
-				return
-			}
-			preTerm = rf.logs[preIndex].Term
+			rf.matchIndex[which] = reply.MyNextIndex
+			rf.nextIndex[which] = reply.MyNextIndex - 1
 			rf.mu.Unlock()
 			//rf.commitChan <- struct{}{}
 		case 1:
@@ -740,7 +737,7 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *Appe
 
 		ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 		if !ok {
-			if count == 5{
+			if count == 5 {
 				DPrintf("duang")
 				return -1
 			}
@@ -751,7 +748,7 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *Appe
 		if !reply.Success {
 			//rf.mu.Lock()
 			if args.Term < reply.Term {
-			//	rf.mu.Unlock()
+				//	rf.mu.Unlock()
 				return 1 // highly term turn to follow
 			}
 			//rf.mu.Unlock()
@@ -811,7 +808,7 @@ func (rf *Raft) autoCommit() {
 	tick := time.NewTicker(100 * time.Millisecond)
 	for {
 		select {
-	//	case <-rf.commitChan:
+		//	case <-rf.commitChan:
 		case <-tick.C:
 		}
 	fastCommit:
@@ -908,7 +905,6 @@ func (rf *Raft) status(ccc int32) {
 		rf.mu.Unlock()
 	}
 }
-
 
 func (rf *Raft) Kill() {
 
