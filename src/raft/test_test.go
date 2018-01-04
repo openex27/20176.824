@@ -650,20 +650,17 @@ func TestFigure82C(t *testing.T) {
 				}
 			}
 		}
-
 		if (rand.Int() % 1000) < 100 {
 			ms := rand.Int63() % (int64(RaftElectionTimeout/time.Millisecond) / 2)
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		} else {
-			ms := (rand.Int63() % 13)
+			ms := rand.Int63() % 13
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
-
 		if leader != -1 {
 			cfg.crash1(leader)
 			nup -= 1
 		}
-
 		if nup < 3 {
 			s := rand.Int() % servers
 			if cfg.rafts[s] == nil {
@@ -673,14 +670,12 @@ func TestFigure82C(t *testing.T) {
 			}
 		}
 	}
-
 	for i := 0; i < servers; i++ {
 		if cfg.rafts[i] == nil {
 			cfg.start1(i)
 			cfg.connect(i)
 		}
 	}
-
 	cfg.one(rand.Int(), servers)
 
 	fmt.Printf("  ... Passed\n")
