@@ -1,22 +1,5 @@
 package raft
 
-//
-// this is an outline of the API that raft must expose to
-// the service (or tester). see comments below for
-// each of these functions for more details.
-//
-// rf = Make(...)
-//   create a new Raft server.
-// rf.Start(command interface{}) (index, term, isleader)
-//   start agreement on a new log entry
-// rf.GetState() (term, isLeader)
-//   ask a Raft for its current term, and whether it thinks it is leader
-// ApplyMsg
-//   each time a new entry is committed to the log, each Raft peer
-//   should send an ApplyMsg to the service (or tester)
-//   in the same server.
-//
-
 import (
 	"bytes"
 	"encoding/gob"
@@ -27,13 +10,14 @@ import (
 import (
 	"labrpc"
 	"sync/atomic"
+	"runtime"
 )
 
 const (
 	HBI = 100
-	LCT = 800
-	FMI = 500 //Follower maintain interval
-	RVI = 500
+	LCT = 400
+	FMI = 200 //Follower maintain interval
+	RVI = 200
 )
 
 type ApplyMsg struct {
@@ -321,7 +305,7 @@ func (rf *Raft) beginVote(oldTerm int) {
 	go rf.beginOnceVote(oldTerm)
 	rf.mu.Unlock()
 	go func() {
-		ms := rand.Int()%200 + RVI
+		ms := rand.Int()%100 + RVI
 		time.Sleep(time.Duration(ms)*time.Millisecond + time.Duration(150))
 		ticker <- struct{}{}
 	}()
@@ -393,34 +377,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.logs = rf.logs[:args.PrevLogTerm+1]
+	rf.logs = rf.logs[:args.PrevLogIndex+1]
 	rf.logs = append(rf.logs, args.Entries...)
 	rf.lastApplied = args.PrevLogIndex + len(args.Entries)
 	reply.MyNextIndex = rf.lastApplied + 1
-	/*
-		newIndex = args.PrevLogIndex + 1
-		if newIndex <= rf.lastApplied {
-			if rf.logs[newIndex].Term == args.EntriesTerm { //Figure 2:AppendEntries 4
-				//rf.lastApplied = newIndex
-				//rf.logs = rf.logs[:newIndex+1]
-			} else { //Figure 2:AppendEntries 3
-				rf.logs[newIndex].Term = args.EntriesTerm
-				rf.logs[newIndex].Log = args.Entries
-				rf.lastApplied = newIndex
-				rf.logs = rf.logs[:rf.lastApplied+1]
-				rf.persist()
-				DPrintf("persist 2")
-			}
-		} else {
-			rf.lastApplied++
-			rf.logs = append(rf.logs, logEntry{
-				Log:  args.Entries,
-				Term: args.EntriesTerm,
-			})
-			rf.persist()
-			DPrintf("persist 3")
-		}
-	*/
+
 Committing:
 	reply.Term = args.Term
 	reply.Success = true
@@ -434,6 +395,7 @@ Committing:
 		} else {
 			minCommit = args.LeaderCommit
 		}
+		//DPrintf("trace = %d len = %d la=%d lc=%d",minCommit,len(rf.logs),rf.lastApplied,args.LeaderCommit)
 		if rf.logs[minCommit].Term == args.Term {
 			for i := rf.commitIndex + 1; i <= minCommit; i++ {
 				DPrintf("i=%d len=%d", i, len(rf.logs))
@@ -620,7 +582,7 @@ func flushBoolSlice(s *[]bool) {
 }
 
 func (rf *Raft) followerMaintain() {
-	t := time.NewTicker(time.Duration(rand.Int()%300+FMI) * time.Millisecond)
+	t := time.NewTicker(time.Duration(rand.Int()%150+FMI) * time.Millisecond)
 	for {
 		<-t.C
 		followerStatus := atomic.LoadInt32(&rf.isFollow)
@@ -672,11 +634,11 @@ func (rf *Raft) catchUp(which int) {
 	var args AppendEntriesArgs
 	defer atomic.StoreInt32(&rf.inCatch[which], int32(0))
 
-	//defer rf.mu.Unlock()
+	rf.mu.Lock()
 	if rf.nextIndex[which] > rf.lastApplied {
+		rf.mu.Unlock()
 		return
 	}
-	rf.mu.Lock()
 	preIndex = rf.nextIndex[which] - 1
 	preTerm = rf.logs[preIndex].Term
 	rf.mu.Unlock()
@@ -737,7 +699,7 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *Appe
 
 		ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 		if !ok {
-			if count == 5 {
+			if count == 3 {
 				DPrintf("duang")
 				return -1
 			}
@@ -903,6 +865,7 @@ func (rf *Raft) status(ccc int32) {
 			DPrintf("Follower: voteFor=%d term=%d %v commitID=%d lastIndex=%d me=%d %v %v", rf.votedFor, rf.currentTerm, rf.logs, rf.commitIndex, rf.lastApplied, rf.me, rf.isLeader, rf.isFollow)
 		}
 		rf.mu.Unlock()
+		DPrintf("goroutince = %d",runtime.NumGoroutine())
 	}
 }
 
@@ -910,6 +873,7 @@ func (rf *Raft) Kill() {
 }
 
 var cc = int32(0)
+
 
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
