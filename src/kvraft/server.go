@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -17,22 +17,26 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	Method string
-	Key string
-	Value string
-	Uid int64
-	Cid int64
+	Key    string
+	Value  string
+	Uid    int64
+	Cid    int64
 
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 }
 
-type callbackMap struct{
+type hashcode struct {
+	Client int64
+	Uid    int64
+}
+
+type callbackMap struct {
 	sync.Mutex
-	M map[int64][]chan bool
+	M map[hashcode][]*chan bool
 }
 
 type RaftKV struct {
@@ -45,60 +49,96 @@ type RaftKV struct {
 
 	// Your definitions here.
 
-	KVstate map[string]string
+	KVstate   map[string]string
 	CliLastId map[int64]int64
 
 	CallBackChan callbackMap
-
 }
 
-func (kv *RaftKV) HandleApply(){
-	for msg := range kv.applyCh{
+func (kv *RaftKV) HandleApply() {
+	for msg := range kv.applyCh {
+
 		op := msg.Command.(Op)
+		//DPrintf("recive applyMsg me=%d method = %s",kv.me,op.Method)
 		kv.mu.Lock()
-		//TODO  finish apply handler
+		switch op.Method {
+		case "Get":
+			if op.Uid > kv.CliLastId[op.Cid]{
+				kv.CliLastId[op.Cid] = op.Uid
+			}
+			go kv.sendSignal(op.Cid,op.Uid)
+		case "Put":
+			if op.Uid > kv.CliLastId[op.Cid]{
+				kv.KVstate[op.Key] = op.Value
+				kv.CliLastId[op.Cid] = op.Uid
+			}
+			go kv.sendSignal(op.Cid,op.Uid)
+		case "Append":
+			if op.Uid > kv.CliLastId[op.Cid]{
+				kv.KVstate[op.Key] = kv.KVstate[op.Key]+op.Value
+				kv.CliLastId[op.Cid] = op.Uid
+			}
+			go kv.sendSignal(op.Cid,op.Uid)
+		}
+		kv.mu.Unlock()
+
 
 	}
 }
 
-// todo callback need adjust
-func (kv *RaftKV) registChan (id int64,c chan bool){
+func (kv *RaftKV)sendSignal(cid,uid int64){
+	DPrintf("begin send")
 	kv.CallBackChan.Lock()
 	defer kv.CallBackChan.Unlock()
-	kv.CallBackChan.M[id] = append(kv.CallBackChan.M[id],c)
+	for _, c := range kv.CallBackChan.M[hashcode{cid, uid}] {
+		*c <- true
+	}
+	delete(kv.CallBackChan.M,hashcode{cid, uid})
+
+}
+
+func (kv *RaftKV) registChan(client, uid int64, c *chan bool) {
+	kv.CallBackChan.Lock()
+	defer kv.CallBackChan.Unlock()
+	tempHC := hashcode{
+		client,
+		uid,
+	}
+	kv.CallBackChan.M[tempHC] = append(kv.CallBackChan.M[tempHC], c)
 }
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
-	if _,isLeader := kv.rf.GetState();!isLeader{
+	if _, isLeader := kv.rf.GetState(); !isLeader {
 		reply.WrongLeader = true
 		return
 	}
 	reply.WrongLeader = false
-	c := make(chan bool)
+	c := make(chan bool, 1)
+	defer close(c)
 	kv.mu.Lock()
-	if LID , ok := kv.CliLastId[args.ClientId];ok&&LID>=args.Uid{
+	if LID, ok := kv.CliLastId[args.ClientId]; ok && LID >= args.Uid {
 		reply.Value = kv.KVstate[args.Key]
 		reply.Err = ""
 		kv.mu.Unlock()
 		return
 	}
-	_,_,suc := kv.rf.Start(Op{
-		"GET",
-		"",// or args.Key?
+	_, _, suc := kv.rf.Start(Op{
+		"Get",
+		"", // or args.Key?
 		"",
 		args.Uid,
 		args.ClientId,
 	})
-	if !suc{
+	if !suc {
 		reply.WrongLeader = true
 		kv.mu.Unlock()
 		return
-	}else{
-		kv.registChan(args.Uid,c)
+	} else {
+		kv.registChan(args.ClientId, args.Uid, &c)
 	}
 	kv.mu.Unlock()
-
-	if ok := <-c;ok{
+	//TODO detect leadership change
+	if ok := <-c; ok {
 		kv.mu.Lock()
 		reply.Value = kv.KVstate[args.Key]
 		kv.mu.Unlock()
@@ -108,41 +148,46 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	if _,isLeader := kv.rf.GetState();!isLeader{
+	if _, isLeader := kv.rf.GetState(); !isLeader {
 		reply.WrongLeader = true
 		return
 	}
 	reply.WrongLeader = false
-	c := make(chan bool)
+	c := make(chan bool,1)
+	defer close(c)
 	kv.mu.Lock()
-	if LID, ok := kv.CliLastId[args.Uid];ok&&LID>=args.Uid{
+	if LID, ok := kv.CliLastId[args.Uid]; ok && LID >= args.Uid {
 		reply.Err = ""
 		kv.mu.Unlock()
 		return
 	}
 	op := Op{
-		Key:args.Key,
-		Value:args.Value,
-		Uid:args.Uid,
-		Cid:args.ClientId,
+		Key:   args.Key,
+		Value: args.Value,
+		Uid:   args.Uid,
+		Cid:   args.ClientId,
 	}
-	if args.Op == "PUT" || args.Op == "APPEND"{
+	if args.Op == "Put" || args.Op == "Append" {
 		op.Method = args.Op
-	}else{
+	} else {
 		kv.mu.Unlock()
 		reply.Err = "unknow Op"
 		return
 	}
-	_,_,suc:= kv.rf.Start(op)
-	if !suc{
+
+	_, _, suc := kv.rf.Start(op)
+	if !suc {
 		reply.WrongLeader = true
+		DPrintf("start error %d",kv.me)
 		kv.mu.Unlock()
 		return
-	}else{
-		kv.registChan(args.Uid,c)
+	} else {
+		kv.registChan(args.ClientId, args.Uid, &c)
 	}
 	kv.mu.Unlock()
-	if ok := <-c;ok{
+	//TODO detect leadership change
+	if ok := <-c; ok {
+		reply.WrongLeader = false
 		reply.Err = ""
 		return
 	}
@@ -190,8 +235,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.CliLastId = make(map[int64]int64)
 	kv.KVstate = make(map[string]string)
 	kv.CallBackChan = callbackMap{
-		M:make(map[int64][]chan bool),
+		M: make(map[hashcode][]*chan bool),
 	}
+	go kv.HandleApply()
 	// You may need initialization code here.
 
 	return kv

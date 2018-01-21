@@ -2,11 +2,20 @@ package raftkv
 
 import "labrpc"
 import "crypto/rand"
-import "math/big"
+import (
+	"math/big"
+	"sync"
+)
 
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
+	mu sync.Mutex
+	leaderId int
+	clientId int64
+	Uid int64
+
+
 	// You will have to modify this struct.
 }
 
@@ -20,6 +29,9 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
+	ck.Uid = int64(0)
+	ck.clientId = nrand()
+	ck.leaderId = 0
 	// You'll have to add code here.
 	return ck
 }
@@ -37,7 +49,29 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	cleader := ck.leaderId
+	ck.Uid++
+	args := GetArgs{
+		Key:key,
+		Uid:ck.Uid,
+		ClientId:ck.clientId,
+	}
 
+	for {
+		reply := new(GetReply)
+		DPrintf("get %v\n",args)
+		if ok := ck.servers[cleader].Call("RaftKV.Get", &args, reply);!ok{
+			continue
+		}
+		if reply.WrongLeader{
+			cleader = (cleader+1)%len(ck.servers)
+			continue
+		}
+		ck.leaderId = cleader
+		return reply.Value
+	}
 	// You will have to modify this function.
 
 	return ""
@@ -55,11 +89,38 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	cleader := ck.leaderId
+	ck.Uid++
+	args := PutAppendArgs{
+		Key:key,
+		Value:value,
+		Op:op,
+		Uid:ck.Uid,
+		ClientId:ck.clientId,
+	}
+
+	for{
+		reply := new(PutAppendReply)
+		DPrintf("put %v \n",args)
+		if ok:=ck.servers[cleader].Call("RaftKV.PutAppend", &args, reply);!ok{
+			continue
+		}
+		if reply.WrongLeader{
+			cleader = (cleader+1)%len(ck.servers)
+			DPrintf("change leader %d\n",cleader)
+			continue
+		}
+		ck.leaderId = cleader
+		return
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
 	ck.PutAppend(key, value, "Put")
 }
+
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
 }
