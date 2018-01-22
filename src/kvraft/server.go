@@ -6,6 +6,10 @@ import (
 	"log"
 	"raft"
 	"sync"
+	"time"
+
+	_ "net/http/pprof"
+	"net/http"
 )
 
 const Debug = 1
@@ -57,7 +61,7 @@ type RaftKV struct {
 
 func (kv *RaftKV) HandleApply() {
 	for msg := range kv.applyCh {
-
+		DPrintf("rtrace=%v me=%d",msg,kv.me)
 		op := msg.Command.(Op)
 		//DPrintf("recive applyMsg me=%d method = %s",kv.me,op.Method)
 		kv.mu.Lock()
@@ -81,8 +85,6 @@ func (kv *RaftKV) HandleApply() {
 			go kv.sendSignal(op.Cid,op.Uid)
 		}
 		kv.mu.Unlock()
-
-
 	}
 }
 
@@ -114,7 +116,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	reply.WrongLeader = false
 	c := make(chan bool, 1)
-	defer close(c)
+	//defer close(c)
 	kv.mu.Lock()
 	if LID, ok := kv.CliLastId[args.ClientId]; ok && LID >= args.Uid {
 		reply.Value = kv.KVstate[args.Key]
@@ -138,12 +140,35 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	kv.mu.Unlock()
 	//TODO detect leadership change
+	t := time.NewTicker(100 * time.Millisecond)
+	for{
+		select {
+		case  <-c:
+			kv.mu.Lock()
+			reply.Value = kv.KVstate[args.Key]
+			kv.mu.Unlock()
+			close(c)
+			return
+			case <-t.C:
+				//if _, isLeader := kv.rf.GetState();!isLeader{
+					DPrintf("tick")
+					reply.WrongLeader = true
+					go func(){
+						<-c
+						close(c)
+					}()
+					return
+				//}
+		}
+	}
+	/*
 	if ok := <-c; ok {
 		kv.mu.Lock()
 		reply.Value = kv.KVstate[args.Key]
 		kv.mu.Unlock()
 	}
 	return
+	*/
 	// Your code here.
 }
 
@@ -154,7 +179,6 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	reply.WrongLeader = false
 	c := make(chan bool,1)
-	defer close(c)
 	kv.mu.Lock()
 	if LID, ok := kv.CliLastId[args.Uid]; ok && LID >= args.Uid {
 		reply.Err = ""
@@ -185,12 +209,33 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		kv.registChan(args.ClientId, args.Uid, &c)
 	}
 	kv.mu.Unlock()
-	//TODO detect leadership change
+	t := time.NewTicker(100 * time.Millisecond)
+	for{
+		select {
+		case  <-c:
+			reply.WrongLeader = false
+			reply.Err = ""
+			close(c)
+			return
+		case <-t.C:
+		//	if _, isLeader := kv.rf.GetState();!isLeader{
+				DPrintf("tick")
+				reply.WrongLeader = true
+				go func(){
+					<-c
+					close(c)
+				}()
+				return
+			//}
+		}
+	}
+	/*
 	if ok := <-c; ok {
 		reply.WrongLeader = false
 		reply.Err = ""
 		return
 	}
+	*/
 	// Your code here.
 }
 
@@ -238,6 +283,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		M: make(map[hashcode][]*chan bool),
 	}
 	go kv.HandleApply()
+	go http.ListenAndServe("127.0.0.1:8080", nil)
 	// You may need initialization code here.
 
 	return kv
