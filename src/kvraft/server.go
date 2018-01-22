@@ -150,7 +150,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 			close(c)
 			return
 			case <-t.C:
-				//if _, isLeader := kv.rf.GetState();!isLeader{
+				if _, isLeader := kv.rf.GetState();!isLeader{
 					DPrintf("tick")
 					reply.WrongLeader = true
 					go func(){
@@ -158,7 +158,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 						close(c)
 					}()
 					return
-				//}
+				}
 		}
 	}
 	/*
@@ -218,7 +218,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			close(c)
 			return
 		case <-t.C:
-		//	if _, isLeader := kv.rf.GetState();!isLeader{
+			if _, isLeader := kv.rf.GetState();!isLeader{
 				DPrintf("tick")
 				reply.WrongLeader = true
 				go func(){
@@ -226,7 +226,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 					close(c)
 				}()
 				return
-			//}
+			}
 		}
 	}
 	/*

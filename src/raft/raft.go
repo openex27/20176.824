@@ -11,7 +11,7 @@ import (
 	"labrpc"
 	"sync/atomic"
 	"runtime"
-	"kevinsync"
+
 )
 
 const (
@@ -39,7 +39,7 @@ type logEntry struct {
 
 type Raft struct {
 	//mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	mu kevinsync.Mutex
+	mu sync.Mutex
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -75,7 +75,7 @@ func (rf *Raft) handleApply(){
 func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
-	rf.mu.Lock(1)
+	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	term = rf.currentTerm
 	if rf.me == rf.votedFor {
@@ -107,7 +107,7 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	rf.mu.Lock(2)
+	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	r := bytes.NewBuffer(data)
 	d := gob.NewDecoder(r)
@@ -144,7 +144,7 @@ type RequestVoteReply struct {
 }
 
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	rf.mu.Lock(3)
+	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if args.CandidateId == rf.me {
 		reply.VoteGranted = true
@@ -220,7 +220,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) beginOnceVote(oldTerm int) {
 	voteRetChan := make(chan bool, 1)
 
-	rf.mu.Lock(4)
+	rf.mu.Lock()
 	if rf.votedFor != -1 || rf.currentTerm > oldTerm {
 		rf.mu.Unlock()
 		return
@@ -246,7 +246,7 @@ func (rf *Raft) beginOnceVote(oldTerm int) {
 				//DPrintf("me=%d, voter=%d\n", rf.me, who)
 				return
 			} else {
-				rf.mu.Lock(5)
+				rf.mu.Lock()
 				if rf.currentTerm < reply.Term { //切换至follow,通过修改currentTerm抑制获得major后升级
 					rf.currentTerm = reply.Term
 					atomic.StoreInt32(&rf.isFollow, int32(1))
@@ -262,7 +262,7 @@ func (rf *Raft) beginOnceVote(oldTerm int) {
 	go func() {
 		count := 0
 		success := 0
-		rf.mu.Lock(6)
+		rf.mu.Lock()
 		all := len(rf.peers)
 		half := all / 2
 		rf.mu.Unlock()
@@ -276,7 +276,7 @@ func (rf *Raft) beginOnceVote(oldTerm int) {
 				success++
 				if !upLevel && success > half {
 					upLevel = true
-					rf.mu.Lock(7)
+					rf.mu.Lock()
 					if rf.currentTerm > oldTerm { //这轮选举已经结束,无法升级
 						rf.mu.Unlock()
 						continue
@@ -305,7 +305,7 @@ func (rf *Raft) beginOnceVote(oldTerm int) {
 //BeginVote 状态成为候选者,发起选举
 func (rf *Raft) beginVote(oldTerm int) {
 	ticker := make(chan struct{})
-	rf.mu.Lock(8)
+	rf.mu.Lock()
 	if rf.currentTerm > oldTerm {
 		rf.mu.Unlock()
 		return
@@ -321,7 +321,7 @@ func (rf *Raft) beginVote(oldTerm int) {
 	}()
 	for {
 		<-ticker
-		rf.mu.Lock(9)
+		rf.mu.Lock()
 		if rf.votedFor != -1 || rf.currentTerm > oldTerm {
 			rf.mu.Unlock()
 			return
@@ -358,7 +358,7 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock(10)
+	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	//var newIndex int
 	if rf.me == args.LeaderId {
@@ -452,7 +452,7 @@ type leaderBand struct {
 }
 
 func (rf *Raft) beginHeartbeat() {
-	rf.mu.Lock(11)
+	rf.mu.Lock()
 	all := len(rf.peers)
 	oldTerm := rf.currentTerm
 	args := AppendEntriesArgs{
@@ -471,7 +471,7 @@ func (rf *Raft) beginHeartbeat() {
 		wg := sync.WaitGroup{}
 		for {
 			<-t.C
-			rf.mu.Lock(12)
+			rf.mu.Lock()
 			if rf.votedFor == -1 || rf.currentTerm > oldTerm {
 				rf.mu.Unlock()
 				wg.Wait()
@@ -493,7 +493,7 @@ func (rf *Raft) beginHeartbeat() {
 							wg.Done()
 						} else {
 							wg.Done()
-							rf.mu.Lock(13)
+							rf.mu.Lock()
 							if rf.currentTerm < reply.Term {
 								rf.currentTerm = reply.Term
 								rf.votedFor = -2
@@ -521,7 +521,7 @@ func (rf *Raft) beginHeartbeat() {
 		once := sync.Once{}
 		sendDoneFunc := func() {
 			done <- struct{}{}
-			rf.mu.Lock(14)
+			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			if rf.currentTerm > oldTerm || rf.votedFor == -1 {
 				return
@@ -603,7 +603,7 @@ func (rf *Raft) followerMaintain() {
 			//DPrintf("%d am follower\n", rf.me)
 			continue
 		}
-		rf.mu.Lock(15)
+		rf.mu.Lock()
 		if rf.votedFor == -1 || rf.votedFor == rf.me {
 			//DPrintf("%d am not follower\n", rf.me)
 			rf.mu.Unlock()
@@ -621,7 +621,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-	rf.mu.Lock(16)
+	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	if rf.votedFor != rf.me {
@@ -646,7 +646,7 @@ func (rf *Raft) catchUp(which int) {
 	var args AppendEntriesArgs
 	defer atomic.StoreInt32(&rf.inCatch[which], int32(0))
 
-	rf.mu.Lock(17)
+	rf.mu.Lock()
 	if rf.nextIndex[which] > rf.lastApplied {
 		rf.mu.Unlock()
 		return
@@ -655,7 +655,7 @@ func (rf *Raft) catchUp(which int) {
 	preTerm = rf.logs[preIndex].Term
 	rf.mu.Unlock()
 	for {
-		rf.mu.Lock(18)
+		rf.mu.Lock()
 		if rf.votedFor != rf.me {
 			rf.mu.Unlock()
 			return
@@ -677,7 +677,7 @@ func (rf *Raft) catchUp(which int) {
 		case -1:
 			return
 		case 0:
-			rf.mu.Lock(19)
+			rf.mu.Lock()
 			rf.matchIndex[which] = reply.MyNextIndex - 1
 			rf.nextIndex[which] = reply.MyNextIndex
 			rf.mu.Unlock()
@@ -685,7 +685,7 @@ func (rf *Raft) catchUp(which int) {
 
 			//rf.commitChan <- struct{}{}
 		case 1:
-			rf.mu.Lock(20)
+			rf.mu.Lock()
 			if rf.currentTerm < reply.Term {
 				rf.currentTerm = reply.Term
 				rf.votedFor = -2
@@ -696,7 +696,7 @@ func (rf *Raft) catchUp(which int) {
 			return
 		case 2:
 			DPrintf("%d reply MyNextIndex = %d", which, reply.MyNextIndex)
-			rf.mu.Lock(21)
+			rf.mu.Lock()
 			preIndex = reply.MyNextIndex - 1
 			preTerm = rf.logs[preIndex].Term
 			//rf.nextIndex[which] = reply.MyNextIndex
@@ -752,7 +752,7 @@ func (rf *Raft) catchUper() {
 		if atomic.LoadInt32(&rf.isLeader) != int32(1) {
 			return
 		}
-		rf.mu.Lock(22)
+		rf.mu.Lock()
 		for follower := 0; follower < len(rf.peers); follower++ {
 			if follower == rf.me {
 				continue
@@ -771,7 +771,7 @@ func (rf *Raft) catchUper() {
 func (rf *Raft) autoCommit() {
 	defer DPrintf("autoCommit Done")
 	var args AppendEntriesArgs
-	rf.mu.Lock(23)
+	rf.mu.Lock()
 	args.Term = rf.currentTerm
 	args.LeaderId = rf.me
 	sumPeer := len(rf.peers)
@@ -789,7 +789,7 @@ func (rf *Raft) autoCommit() {
 		if atomic.LoadInt32(&rf.isLeader) != int32(1) {
 			return
 		}
-		rf.mu.Lock(24)
+		rf.mu.Lock()
 		if rf.lastApplied == rf.commitIndex {
 			rf.mu.Unlock()
 			continue
@@ -838,8 +838,8 @@ func (rf *Raft) autoCommit() {
 				Command: rf.logs[checkIndex].Log,
 			}
 			rf.mu.Unlock()
-			rf.bufApplyCh<- tempApply
-			rf.mu.Lock(24)
+			rf.bufApplyCh <- tempApply
+			rf.mu.Lock()
 			rf.logs[checkIndex].Committed = true
 			DPrintf("commit value me=%d log[%d]=%d ", rf.me, checkIndex, rf.logs[checkIndex].Log)
 			rf.persist()
@@ -872,8 +872,8 @@ func (rf *Raft) status(ccc int32) {
 		if atomic.LoadInt32(&cc)-int32(3) > ccc {
 			return
 		}
-		DPrintf("goroutince = %d  checking =%d",runtime.NumGoroutine(),rf.mu.Checking())
-		rf.mu.Lock(25)
+		DPrintf("goroutince = %d ",runtime.NumGoroutine())
+		rf.mu.Lock()
 		if rf.votedFor == rf.me {
 			DPrintf("Leader: %v matchID=%d leaderCID=%d me=%d", rf.logs, rf.matchIndex, rf.commitIndex, rf.me)
 		} else if rf.votedFor == -1 {

@@ -105,11 +105,13 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		reply := new(PutAppendReply)
 		DPrintf("put %v \n",args)
 		if ok:=ck.servers[cleader].Call("RaftKV.PutAppend", &args, reply);!ok{
+			//DPrintf("connect %d error",cleader)
+			cleader = (cleader+1)%len(ck.servers)
 			continue
 		}
 		if reply.WrongLeader{
 			cleader = (cleader+1)%len(ck.servers)
-			DPrintf("change leader %d\n",cleader)
+			//DPrintf("change leader %d\n",cleader)
 			continue
 		}
 		ck.leaderId = cleader
