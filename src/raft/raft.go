@@ -9,8 +9,8 @@ import (
 )
 import (
 	"labrpc"
-	"sync/atomic"
 	"runtime"
+	"sync/atomic"
 
 	_ "net/http/pprof"
 )
@@ -40,7 +40,7 @@ type logEntry struct {
 
 type Raft struct {
 	//mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	mu sync.Mutex
+	mu        sync.Mutex
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -65,9 +65,9 @@ type Raft struct {
 	startChan chan struct{}
 }
 
-func (rf *Raft) handleApply(){
-	for{
-		rf.applyCh<-<-rf.bufApplyCh
+func (rf *Raft) handleApply() {
+	for {
+		rf.applyCh <- <-rf.bufApplyCh
 	}
 }
 
@@ -127,9 +127,9 @@ func (rf *Raft) readPersist(data []byte) {
 		}
 		logLen--
 	}
-	for i:=1;i<=rf.commitIndex;i++{
-		rf.bufApplyCh <-ApplyMsg{
-			Index:  i,
+	for i := 1; i <= rf.commitIndex; i++ {
+		rf.bufApplyCh <- ApplyMsg{
+			Index:   i,
 			Command: rf.logs[i].Log,
 		}
 	}
@@ -471,7 +471,7 @@ func (rf *Raft) beginHeartbeat() {
 	rf.mu.Unlock()
 	go rf.autoCommit()
 	go rf.catchUper()
-	recvAppend := make(chan int, 5)
+	recvAppend := make(chan int)
 
 	go func() { //以HBI为周期发送心跳给各follow
 		t := time.NewTicker(HBI * time.Millisecond)
@@ -488,7 +488,7 @@ func (rf *Raft) beginHeartbeat() {
 			args.LeaderCommit = rf.commitIndex
 			rf.mu.Unlock()
 			for i := 0; i < all; i++ {
-				if hbf := atomic.LoadInt32(&rf.hbf[i]); hbf != int32(0) {
+				if hbf := atomic.LoadInt32(&rf.hbf[i]); hbf != int32(0)||i==rf.me {
 					continue
 				}
 				wg.Add(1)
@@ -517,6 +517,61 @@ func (rf *Raft) beginHeartbeat() {
 		}
 	}()
 
+	go func() {
+		major := all/2 + 1
+		count := 1
+		markArr := make([]bool, all, all)
+		lctTimer := time.NewTimer(LCT * time.Millisecond)
+		chandrain := func() { //清空channel防止泄露
+			for {
+				_, ok := <-recvAppend
+				if !ok {
+					return
+				}
+			}
+		}
+		for {
+			select {
+			case <-lctTimer.C:
+				lctTimer.Stop()
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				go chandrain()
+				if rf.currentTerm > oldTerm || rf.votedFor == -1 {
+					return
+				}
+				rf.votedFor = -2
+				atomic.StoreInt32(&rf.isFollow, int32(1))
+				atomic.StoreInt32(&rf.isLeader, int32(0))
+				DPrintf("heartbreak by timeout")
+				return
+
+			case who, ok := <-recvAppend:
+				if !ok {
+					if !lctTimer.Stop() {
+						<-lctTimer.C
+					}
+					go chandrain()
+				}
+				if markArr[who] {
+					continue
+				}
+				count++
+				if count == major {
+					if !lctTimer.Stop() {
+						<-lctTimer.C
+					}
+					lctTimer.Reset(LCT * time.Millisecond)
+					flushBoolSlice(&markArr)
+					count = 1
+					continue
+				}
+				markArr[who] = true
+
+			}
+		}
+	}()
+	/*
 	go func() { //心跳接收,判断是否leader失效
 		major := all/2 + 1
 		firstLB := leaderBand{
@@ -590,7 +645,7 @@ func (rf *Raft) beginHeartbeat() {
 				}
 			}
 		}
-	}()
+	}()*/
 }
 
 func flushBoolSlice(s *[]bool) {
@@ -643,7 +698,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.nextIndex[rf.me] = rf.lastApplied + 1
 		index, term, isLeader = rf.lastApplied, rf.currentTerm, true
 		rf.persist()
-		go func(){
+		go func() {
 			rf.startChan <- struct{}{}
 		}()
 	}
@@ -842,8 +897,8 @@ func (rf *Raft) autoCommit() {
 		}
 		if count > sumPeer/2 {
 			rf.commitIndex = checkIndex
-			DPrintf("strace=%v me=%d",rf.logs[checkIndex].Log,rf.me)
-			tempApply :=  ApplyMsg{
+			DPrintf("strace=%v me=%d", rf.logs[checkIndex].Log, rf.me)
+			tempApply := ApplyMsg{
 				Index:   checkIndex,
 				Command: rf.logs[checkIndex].Log,
 			}
@@ -882,7 +937,7 @@ func (rf *Raft) status(ccc int32) {
 		if atomic.LoadInt32(&cc)-int32(3) > ccc {
 			return
 		}
-		DPrintf("goroutince = %d ",runtime.NumGoroutine())
+		DPrintf("goroutince = %d ", runtime.NumGoroutine())
 		rf.mu.Lock()
 		if rf.votedFor == rf.me {
 			DPrintf("Leader: %v matchID=%d leaderCID=%d me=%d", rf.logs, rf.matchIndex, rf.commitIndex, rf.me)
@@ -900,7 +955,6 @@ func (rf *Raft) Kill() {
 
 var cc = int32(0)
 
-
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	defer DPrintf("make raft %v", cc)
@@ -912,7 +966,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.votedFor = -2
 	rf.applyCh = applyCh
-	rf.bufApplyCh = make(chan ApplyMsg,10)
+	rf.bufApplyCh = make(chan ApplyMsg, 10)
 	go rf.handleApply()
 	rf.lastApplied = 0
 	rf.commitIndex = 0
