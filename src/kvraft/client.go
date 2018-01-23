@@ -100,7 +100,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Uid:ck.Uid,
 		ClientId:ck.clientId,
 	}
-
 	for{
 		reply := new(PutAppendReply)
 		DPrintf("put %v \n",args)

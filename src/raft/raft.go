@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"runtime"
 
+	_ "net/http/pprof"
 )
 
 const (
@@ -125,6 +126,12 @@ func (rf *Raft) readPersist(data []byte) {
 			break
 		}
 		logLen--
+	}
+	for i:=1;i<=rf.commitIndex;i++{
+		rf.bufApplyCh <-ApplyMsg{
+			Index:  i,
+			Command: rf.logs[i].Log,
+		}
 	}
 	if Debug == 3 {
 		DPrintf("read persisted %v commitID=%d lastIndex=%d me=%d", rf.logs, rf.commitIndex, rf.lastApplied, rf.me)
@@ -412,9 +419,9 @@ Committing:
 					Index:   i,
 					Command: rf.logs[i].Log,
 				}
-				//rf.mu.Unlock()
+				rf.mu.Unlock()
 				rf.bufApplyCh <- tempApply
-				//rf.mu.Lock(10)
+				rf.mu.Lock()
 				DPrintf("follower commit value me=%d log[%d]=%d ", rf.me, i, rf.logs[i].Log)
 				rf.logs[i].Committed = true
 			}
@@ -636,6 +643,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.nextIndex[rf.me] = rf.lastApplied + 1
 		index, term, isLeader = rf.lastApplied, rf.currentTerm, true
 		rf.persist()
+		go func(){
+			rf.startChan <- struct{}{}
+		}()
 	}
 	return index, term, isLeader
 }
@@ -743,7 +753,7 @@ func (rf *Raft) catchUper() {
 		atomic.StoreInt32(&rf.inCatch[follower], int32(1))
 		go rf.catchUp(follower)
 	}
-	tick := time.NewTicker(50 * time.Millisecond)
+	tick := time.NewTicker(200 * time.Millisecond)
 	for {
 		select {
 		case <-rf.startChan:
@@ -903,6 +913,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -2
 	rf.applyCh = applyCh
 	rf.bufApplyCh = make(chan ApplyMsg,10)
+	go rf.handleApply()
 	rf.lastApplied = 0
 	rf.commitIndex = 0
 	rf.logs = []logEntry{logEntry{
@@ -924,6 +935,5 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.followerMaintain()
 	go rf.status(ccc)
 	go rf.flushHBF()
-	go rf.handleApply()
 	return rf
 }
