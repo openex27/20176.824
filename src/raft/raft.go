@@ -11,6 +11,8 @@ import (
 	"labrpc"
 	"sync/atomic"
 	"runtime"
+
+	_ "net/http/pprof"
 )
 
 const (
@@ -37,7 +39,8 @@ type logEntry struct {
 }
 
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	//mu        sync.Mutex          // Lock to protect shared access to this peer's state
+	mu sync.Mutex
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -55,10 +58,17 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 	applyCh    chan ApplyMsg
+	bufApplyCh chan ApplyMsg
 
 	inCatch   []int32
 	hbf       []int32
 	startChan chan struct{}
+}
+
+func (rf *Raft) handleApply(){
+	for{
+		rf.applyCh<-<-rf.bufApplyCh
+	}
 }
 
 // return currentTerm and whether this server
@@ -116,6 +126,12 @@ func (rf *Raft) readPersist(data []byte) {
 			break
 		}
 		logLen--
+	}
+	for i:=1;i<=rf.commitIndex;i++{
+		rf.bufApplyCh <-ApplyMsg{
+			Index:  i,
+			Command: rf.logs[i].Log,
+		}
 	}
 	if Debug == 3 {
 		DPrintf("read persisted %v commitID=%d lastIndex=%d me=%d", rf.logs, rf.commitIndex, rf.lastApplied, rf.me)
@@ -277,6 +293,7 @@ func (rf *Raft) beginOnceVote(oldTerm int) {
 							atomic.StoreInt32(&rf.isLeader, int32(1))
 							DPrintf("be leader %v LA=%d LC=%d me=%d", rf.logs, rf.lastApplied, rf.commitIndex, rf.me)
 							rf.nextIndex = make([]int, all, all)
+							//tempNext := rf.lastApplied
 							for i := 0; i < all; i++ {
 								rf.nextIndex[i] = rf.lastApplied + 1
 							}
@@ -351,7 +368,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	//var newIndex int
-
 	if rf.me == args.LeaderId {
 		reply.Term = args.Term
 		reply.Success = true
@@ -399,10 +415,13 @@ Committing:
 		if rf.logs[minCommit].Term == args.Term {
 			for i := rf.commitIndex + 1; i <= minCommit; i++ {
 				DPrintf("i=%d len=%d", i, len(rf.logs))
-				rf.applyCh <- ApplyMsg{
+				tempApply := ApplyMsg{
 					Index:   i,
 					Command: rf.logs[i].Log,
 				}
+				rf.mu.Unlock()
+				rf.bufApplyCh <- tempApply
+				rf.mu.Lock()
 				DPrintf("follower commit value me=%d log[%d]=%d ", rf.me, i, rf.logs[i].Log)
 				rf.logs[i].Committed = true
 			}
@@ -624,6 +643,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.nextIndex[rf.me] = rf.lastApplied + 1
 		index, term, isLeader = rf.lastApplied, rf.currentTerm, true
 		rf.persist()
+		go func(){
+			rf.startChan <- struct{}{}
+		}()
 	}
 	return index, term, isLeader
 }
@@ -731,7 +753,7 @@ func (rf *Raft) catchUper() {
 		atomic.StoreInt32(&rf.inCatch[follower], int32(1))
 		go rf.catchUp(follower)
 	}
-	tick := time.NewTicker(50 * time.Millisecond)
+	tick := time.NewTicker(200 * time.Millisecond)
 	for {
 		select {
 		case <-rf.startChan:
@@ -820,10 +842,14 @@ func (rf *Raft) autoCommit() {
 		}
 		if count > sumPeer/2 {
 			rf.commitIndex = checkIndex
-			rf.applyCh <- ApplyMsg{
+			DPrintf("strace=%v me=%d",rf.logs[checkIndex].Log,rf.me)
+			tempApply :=  ApplyMsg{
 				Index:   checkIndex,
 				Command: rf.logs[checkIndex].Log,
 			}
+			rf.mu.Unlock()
+			rf.bufApplyCh <- tempApply
+			rf.mu.Lock()
 			rf.logs[checkIndex].Committed = true
 			DPrintf("commit value me=%d log[%d]=%d ", rf.me, checkIndex, rf.logs[checkIndex].Log)
 			rf.persist()
@@ -856,6 +882,7 @@ func (rf *Raft) status(ccc int32) {
 		if atomic.LoadInt32(&cc)-int32(3) > ccc {
 			return
 		}
+		DPrintf("goroutince = %d ",runtime.NumGoroutine())
 		rf.mu.Lock()
 		if rf.votedFor == rf.me {
 			DPrintf("Leader: %v matchID=%d leaderCID=%d me=%d", rf.logs, rf.matchIndex, rf.commitIndex, rf.me)
@@ -865,7 +892,6 @@ func (rf *Raft) status(ccc int32) {
 			DPrintf("Follower: voteFor=%d term=%d %v commitID=%d lastIndex=%d me=%d %v %v", rf.votedFor, rf.currentTerm, rf.logs, rf.commitIndex, rf.lastApplied, rf.me, rf.isLeader, rf.isFollow)
 		}
 		rf.mu.Unlock()
-		DPrintf("goroutince = %d",runtime.NumGoroutine())
 	}
 }
 
@@ -886,6 +912,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.votedFor = -2
 	rf.applyCh = applyCh
+	rf.bufApplyCh = make(chan ApplyMsg,10)
+	go rf.handleApply()
 	rf.lastApplied = 0
 	rf.commitIndex = 0
 	rf.logs = []logEntry{logEntry{

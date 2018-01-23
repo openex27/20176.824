@@ -13,7 +13,10 @@ import "fmt"
 import "time"
 import "math/rand"
 import "sync/atomic"
-import "sync"
+import (
+	"sync"
+	"net/http"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -634,7 +637,7 @@ func TestFigure82C(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false)
 	defer cfg.cleanup()
-
+	go http.ListenAndServe("127.0.0.1:8080", nil)
 	fmt.Printf("Test (2C): Figure 8 ...\n")
 
 	cfg.one(rand.Int(), 1)
@@ -657,10 +660,12 @@ func TestFigure82C(t *testing.T) {
 			ms := rand.Int63() % 13
 			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
+
 		if leader != -1 {
 			cfg.crash1(leader)
 			nup -= 1
 		}
+
 		if nup < 3 {
 			s := rand.Int() % servers
 			if cfg.rafts[s] == nil {
