@@ -424,13 +424,14 @@ Committing:
 				rf.mu.Unlock()
 				rf.bufApplyCh <- tempApply
 				rf.mu.Lock()
-				DPrintf("follower commit value me=%d log[%d]=%d ", rf.me, i, rf.logs[i].Log)
+				DPrintf("follower commit value me=%d log[%d]=%v ", rf.me, i, rf.logs[i].Log)
 				rf.logs[i].Committed = true
 			}
 			rf.commitIndex = minCommit
+			rf.persist()
 		}
 	}
-	rf.persist()
+
 }
 
 func (rf *Raft) findMyNextIndex(nowIndex int) (myNextInext int) {
@@ -728,7 +729,7 @@ func (rf *Raft) autoCommit() {
 			rf.bufApplyCh <- tempApply
 			rf.mu.Lock()
 			rf.logs[checkIndex].Committed = true
-			DPrintf("commit value me=%d log[%d]=%d ", rf.me, checkIndex, rf.logs[checkIndex].Log)
+			DPrintf("commit value me=%d log[%d]=%v ", rf.me, checkIndex, rf.logs[checkIndex].Log)
 			rf.persist()
 			rf.mu.Unlock()
 			goto fastCommit
