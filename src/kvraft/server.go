@@ -8,7 +8,8 @@ import (
 	"sync"
 	"time"
 
-
+	"net/http"
+	_ "net/http/pprof"
 )
 
 const Debug = 0
@@ -266,6 +267,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	go kv.HandleApply()
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	go http.ListenAndServe("127.0.0.1:8080",nil)
 	// You may need initialization code here.
 
 	return kv
