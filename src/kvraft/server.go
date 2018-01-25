@@ -10,6 +10,7 @@ import (
 
 	"net/http"
 	_ "net/http/pprof"
+	"bytes"
 )
 
 const Debug = 0
@@ -50,6 +51,8 @@ type RaftKV struct {
 	applyCh chan raft.ApplyMsg
 
 	maxraftstate int // snapshot if log grows this big
+	lastIncludeIndex int
+	persister *raft.Persister
 
 	// Your definitions here.
 
@@ -61,6 +64,16 @@ type RaftKV struct {
 
 func (kv *RaftKV) HandleApply() {
 	for msg := range kv.applyCh {
+		if msg.UseSnapshot{
+			kv.mu.Lock()
+			r := bytes.NewBuffer(msg.Snapshot)
+			d := gob.NewDecoder(r)
+			d.Decode(&kv.KVstate)
+			d.Decode(&kv.CliLastId)
+			d.Decode(&kv.lastIncludeIndex)
+			kv.mu.Unlock()
+			continue
+		}
 		op := msg.Command.(Op)
 		//DPrintf("recive applyMsg me=%d method = %s",kv.me,op.Method)
 		kv.mu.Lock()
@@ -82,6 +95,26 @@ func (kv *RaftKV) HandleApply() {
 				kv.CliLastId[op.Cid] = op.Uid
 			}
 			go kv.sendSignal(op.Cid,op.Uid)
+		}
+		kv.lastIncludeIndex = msg.Index
+		kv.mu.Unlock()
+	}
+}
+
+func (kv *RaftKV) makeSnapshot() {
+	c := kv.rf.GetSnapshotSignalChan()
+	for{
+		<-c
+		kv.mu.Lock()
+		if kv.persister.RaftStateSize() > kv.maxraftstate{
+			w := new(bytes.Buffer)
+			e := gob.NewEncoder(w)
+			e.Encode(kv.KVstate)
+			e.Encode(kv.CliLastId)
+			e.Encode(kv.lastIncludeIndex)
+
+			kv.persister.SaveSnapshot(w.Bytes())
+			go kv.rf.TrimOldLogs(kv.lastIncludeIndex)
 		}
 		kv.mu.Unlock()
 	}
@@ -121,6 +154,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 		kv.mu.Unlock()
 		return
 	}
+	kv.mu.Unlock()
 	_, _, suc := kv.rf.Start(Op{
 		"Get",
 		"", // or args.Key?
@@ -130,13 +164,12 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	})
 	if !suc {
 		reply.WrongLeader = true
-		kv.mu.Unlock()
+		//kv.mu.Unlock()
 		return
 	} else {
 		kv.registChan(args.ClientId, args.Uid, &c)
 	}
-	kv.mu.Unlock()
-	//TODO detect leadership change
+	//kv.mu.Unlock()
 	t := time.NewTicker(500 * time.Millisecond)
 	for{
 		select {
@@ -188,17 +221,17 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = "unknow Op"
 		return
 	}
-
+	kv.mu.Unlock()
 	_, _, suc := kv.rf.Start(op)
 	if !suc {
 		reply.WrongLeader = true
 		DPrintf("start error %d",kv.me)
-		kv.mu.Unlock()
+		//kv.mu.Unlock()
 		return
 	} else {
 		kv.registChan(args.ClientId, args.Uid, &c)
 	}
-	kv.mu.Unlock()
+	//kv.mu.Unlock()
 	t := time.NewTicker(500 * time.Millisecond)
 	for{
 		select {
@@ -255,6 +288,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(RaftKV)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
 	// You may need initialization code here.
 
@@ -265,6 +299,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		M: make(map[hashcode][]*chan bool),
 	}
 	go kv.HandleApply()
+	go kv.makeSnapshot()
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	go http.ListenAndServe("127.0.0.1:8080",nil)
