@@ -102,6 +102,9 @@ func (kv *RaftKV) HandleApply() {
 }
 
 func (kv *RaftKV) makeSnapshot() {
+	if kv.maxraftstate <0{
+		return
+	}
 	c := kv.rf.GetSnapshotSignalChan()
 	for{
 		<-c
