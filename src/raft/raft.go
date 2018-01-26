@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 
 	_ "net/http/pprof"
+	"fmt"
 )
 
 const (
@@ -103,17 +104,21 @@ func (rf *Raft) persist() {
 	}
 }
 
-func (rf *Raft) TrimOldLogs(lastIndex int) {
+func (rf *Raft) TrimOldLogs(lastIndex int,threshold int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	if rf.persister.RaftStateSize() < threshold || rf.headIndex> lastIndex {
+		return
+	}
 	rf.snapLastIndex = lastIndex
 	rf.snapLastTerm = rf.logs[lastIndex-rf.headIndex].Term
 
-	tempLogs := make([]logEntry, len(rf.logs))
+	tempLogs := make([]logEntry,len(rf.logs[lastIndex-rf.headIndex+1:]),len(rf.logs))
 	copy(tempLogs, rf.logs[lastIndex-rf.headIndex+1:])
 	rf.logs = tempLogs
 	rf.headIndex = lastIndex + 1
 	rf.persist()
+	fmt.Printf("me=%d trim %d  log=%v\n",rf.me,lastIndex,rf.logs)
 }
 
 //
@@ -137,27 +142,31 @@ func (rf *Raft) readPersist(data []byte) {
 	logLen := len(rf.logs) - 1
 	if rf.snapLastIndex != -1 {
 		rf.lastApplied = rf.headIndex + logLen
+		rf.applyCh <- ApplyMsg{
+			UseSnapshot:true,
+			Snapshot:rf.persister.ReadSnapshot(),
+		}
 	} else {
 		rf.lastApplied = logLen
 	}
 
 	for {
-		if logLen == 0 {
+		if logLen <= 0 {
 			break
 		}
 		if rf.logs[logLen].Committed == true {
-			rf.commitIndex = logLen + rf.headIndex
 			break
 		}
 		logLen--
 	}
+	rf.commitIndex = logLen + rf.headIndex
 	var i int
 	if rf.headIndex == 0 {
 		i = 1
 	} else {
 		i = 0
 	}
-	for ; i <= rf.commitIndex; i++ {
+	for ; i <= rf.commitIndex-rf.headIndex; i++ {
 		rf.applyCh <- ApplyMsg{
 			Index:   i + rf.headIndex,
 			Command: rf.logs[i].Log,
@@ -199,14 +208,16 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.snapLastIndex = args.LastIncludedIndex
 		rf.lastApplied = args.LastIncludedIndex
 		rf.commitIndex = args.LastIncludedIndex
-		rf.logs = make([]logEntry, 8)
+		rf.logs = make([]logEntry, 0,8)
 		rf.applyCh <- ApplyMsg{
 			UseSnapshot: true,
 			Snapshot:    args.Data,
 		}
 		rf.persist()
 	} else {
-
+		if rf.headIndex > args.LastIncludedIndex{
+			return
+		}
 		if rf.logs[args.LastIncludedIndex-rf.headIndex].Term == args.LastIncludedTerm && rf.logs[args.LastIncludedIndex-rf.headIndex].Committed {
 			return
 		} else {
@@ -214,8 +225,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			rf.snapLastTerm = args.LastIncludedTerm
 			rf.snapLastIndex = args.LastIncludedIndex
 			rf.commitIndex = args.LastIncludedIndex
-			tempLog := make([]logEntry, len(rf.logs))
-			copy(tempLog, rf.logs[args.LastIncludedIndex+1:])
+			tempLog := make([]logEntry, len(rf.logs[args.LastIncludedIndex-rf.headIndex+1:]),len(rf.logs))
+			copy(tempLog, rf.logs[args.LastIncludedIndex-rf.headIndex+1:])
 			rf.logs = tempLog
 			rf.applyCh <- ApplyMsg{
 				UseSnapshot: true,
@@ -252,7 +263,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	if args.Term > rf.currentTerm {
-		if args.LastLogTerm > rf.logs[rf.lastApplied-rf.headIndex].Term {
+		var localTerm int
+		if rf.headIndex > rf.lastApplied{
+			localTerm = rf.snapLastTerm
+		}else{
+			localTerm = rf.logs[rf.lastApplied-rf.headIndex].Term
+		}
+		if args.LastLogTerm > localTerm {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateId
 			reply.Term = args.Term
@@ -260,7 +277,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			atomic.StoreInt32(&rf.isFollow, int32(1))
 			atomic.StoreInt32(&rf.isLeader, int32(0))
 			rf.persist()
-		} else if args.LastLogTerm == rf.logs[rf.lastApplied-rf.headIndex].Term && args.LastLogIndex >= rf.lastApplied {
+		} else if args.LastLogTerm == localTerm && args.LastLogIndex >= rf.lastApplied {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateId
 			reply.Term = args.Term
@@ -281,7 +298,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			go rf.beginVote(rf.currentTerm)
 		}
 	} else if rf.votedFor == -1 || rf.votedFor == -2 { // RequestVote RPC : Receiver implementation 2(part)
-		if args.LastLogTerm > rf.logs[rf.lastApplied-rf.headIndex].Term {
+		var localTerm int
+		if rf.headIndex > rf.lastApplied{
+			localTerm = rf.snapLastTerm
+		}else{
+			localTerm = rf.logs[rf.lastApplied-rf.headIndex].Term
+		}
+		if args.LastLogTerm > localTerm {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateId
 			reply.Term = args.Term
@@ -289,7 +312,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			atomic.StoreInt32(&rf.isFollow, int32(1))
 			atomic.StoreInt32(&rf.isLeader, int32(0))
 			rf.persist()
-		} else if args.LastLogTerm == rf.logs[rf.lastApplied-rf.headIndex].Term && args.LastLogIndex >= rf.lastApplied {
+		} else if args.LastLogTerm == localTerm && args.LastLogIndex >= rf.lastApplied {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.CandidateId
 			reply.Term = args.Term
@@ -320,11 +343,18 @@ func (rf *Raft) beginOnceVote(oldTerm int) {
 		rf.mu.Unlock()
 		return
 	}
+
 	args := RequestVoteArgs{
 		Term:         oldTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: rf.lastApplied,
-		LastLogTerm:  rf.logs[rf.lastApplied-rf.headIndex].Term,
+	//	LastLogTerm:  rf.logs[rf.lastApplied-rf.headIndex].Term,
+	}
+
+	if (rf.lastApplied-rf.headIndex) == -1{
+		args.LastLogTerm = rf.snapLastTerm
+	}else{
+		args.LastLogTerm = rf.logs[rf.lastApplied-rf.headIndex].Term
 	}
 	//DPrintf("start new voting i am %d  term = %d vf:=%d", rf.me, rf.currentTerm, rf.votedFor)
 	rf.mu.Unlock()
@@ -490,6 +520,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				return
 			}
 		case realIndex < -1:
+			reply.Success = false
+			reply.MyNextIndex = rf.headIndex
+			return
 		default:
 			if args.PrevLogTerm != rf.logs[realIndex].Term {
 				//reply.Term = rf.currentTerm
@@ -501,7 +534,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	}
 
-	rf.logs = rf.logs[:args.PrevLogIndex-rf.headIndex+1]
+	rf.logs = rf.logs[:args.PrevLogIndex-rf.headIndex+1] //TODO
 	rf.logs = append(rf.logs, args.Entries...)
 	rf.lastApplied = args.PrevLogIndex + len(args.Entries)
 
@@ -520,7 +553,13 @@ Committing:
 			minCommit = args.LeaderCommit
 		}
 		//DPrintf("trace = %d len = %d la=%d lc=%d",minCommit,len(rf.logs),rf.lastApplied,args.LeaderCommit)
-		if rf.logs[minCommit-rf.headIndex].Term == args.Term {
+		var localTerm int
+		if rf.headIndex > minCommit{
+			localTerm = rf.snapLastTerm
+		}else{
+			localTerm = rf.logs[minCommit-rf.headIndex].Term
+		}
+		if localTerm == args.Term {
 			for i := rf.commitIndex + 1; i <= minCommit; i++ {
 				tempApply := ApplyMsg{
 					Index:   i,
@@ -645,7 +684,7 @@ func (rf *Raft) beginHeartbeat() {
 							args.PrevLogIndex = rf.snapLastIndex
 							args.PrevLogTerm = rf.snapLastTerm
 							args.Entries = make([]logEntry, len(rf.logs))
-							copy(args.Entries, rf.logs[:])
+							copy(args.Entries, rf.logs)
 						}
 					}
 					rf.mu.Unlock()
@@ -802,6 +841,9 @@ func (rf *Raft) autoCommit() {
 	args.LeaderId = rf.me
 	sumPeer := len(rf.peers)
 	catchIndex := rf.lastApplied
+	if rf.headIndex > 0{
+		catchIndex = rf.headIndex
+	}
 	rf.mu.Unlock()
 
 	catched := false

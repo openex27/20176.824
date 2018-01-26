@@ -13,7 +13,7 @@ import (
 	"bytes"
 )
 
-const Debug = 0
+const Debug = 2
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -63,7 +63,9 @@ type RaftKV struct {
 }
 
 func (kv *RaftKV) HandleApply() {
+
 	for msg := range kv.applyCh {
+		DPrintf("me=%d index = %d command = %v\n",kv.me,msg.Index,msg.Command)
 		if msg.UseSnapshot{
 			kv.mu.Lock()
 			r := bytes.NewBuffer(msg.Snapshot)
@@ -74,6 +76,7 @@ func (kv *RaftKV) HandleApply() {
 			kv.mu.Unlock()
 			continue
 		}
+
 		op := msg.Command.(Op)
 		//DPrintf("recive applyMsg me=%d method = %s",kv.me,op.Method)
 		kv.mu.Lock()
@@ -117,7 +120,9 @@ func (kv *RaftKV) makeSnapshot() {
 			e.Encode(kv.lastIncludeIndex)
 
 			kv.persister.SaveSnapshot(w.Bytes())
-			go kv.rf.TrimOldLogs(kv.lastIncludeIndex)
+			kv.mu.Unlock()
+			kv.rf.TrimOldLogs(kv.lastIncludeIndex, kv.maxraftstate)
+			continue
 		}
 		kv.mu.Unlock()
 	}
@@ -302,9 +307,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		M: make(map[hashcode][]*chan bool),
 	}
 	go kv.HandleApply()
-	go kv.makeSnapshot()
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
+	go kv.makeSnapshot()
 	go http.ListenAndServe("127.0.0.1:8080",nil)
 	// You may need initialization code here.
 
